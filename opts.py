@@ -50,3 +50,8 @@ parser.add_argument('--smoothing', type=float, default=0.05, help='lambda in the
 parser.add_argument('--conf-type', default='softmax', choices=['softmax', 'margin'])
 
 parser.add_argument('--instance-av', default=False, action='store_true', help='To show average over instances in testing rather than per adverb class')
+
+# WandB configuration
+parser.add_argument('--wandb_config', type=str, default=None, help='Path to wandb configuration file (JSON or YAML) containing API key and other settings')
+parser.add_argument('--wandb-run-name', type=str, default='euclidean')
+parser.add_argument('--no-wandb', action='store_true', default=False, help='Disable wandb logging')

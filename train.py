@@ -11,6 +11,8 @@ from utils import save_args, introduce_adverbs, save_checkpoint, calculate_p1, c
 from opts import parser
 from dataset import AdverbDataset
 from model import ActionModifiers, Evaluator
+from wandb_config import init_wandb_with_config
+import wandb
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -18,6 +20,20 @@ from torch.utils.tensorboard import SummaryWriter
 def main(args):
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     save_args(args)
+    
+    # Initialize wandb with config file support
+    init_wandb_with_config(
+        project_name="pseudo-adverbs",
+        run_name=args.wandb_run_name,
+        model_config=vars(args),
+        checkpoint_dir=args.checkpoint_dir,
+        config_path=getattr(args, 'wandb_config', None),
+        disable_wandb=args.no_wandb
+    )
+    
+
+    # Log manifold type
+    print(f"Training on {args.manifold} manifold")
 
     train_set = AdverbDataset(args.data_dir, args.train_feature_dir, agg=args.temporal_agg,
                               modality=args.modality, window_size=args.t_train,
@@ -75,18 +91,20 @@ def main(args):
         pseudo_weight = 0.0
     else:
         pseudo_weight = 0.0
-    test(model, test_loader, evaluator, writer, start_epoch)
+    test(model, test_loader, evaluator, writer, start_epoch, args)
     for epoch in range(start_epoch, start_epoch+args.max_epochs+1):
         if args.pretrain_action and epoch == args.adverb_start:
             introduce_adverbs(optimizer, args.lr)
-        adverb_thresholds = train(model, train_loader, optimizer, writer, epoch, args.unlabelled_ratio, pseudo_weight, pseudo_always_action, args.num_pseudo_labelled, args.pseudo_selection, adverb_thresholds)
+        adverb_thresholds = train(model, train_loader, optimizer, writer, epoch, args.unlabelled_ratio, pseudo_weight, pseudo_always_action, args.num_pseudo_labelled, args.pseudo_selection, adverb_thresholds, args)
         if epoch % args.eval_interval == 0:
-            test(model, test_loader, evaluator, writer, epoch)
+            test(model, test_loader, evaluator, writer, epoch, args)
         if epoch % args.save_interval == 0 and epoch > 0:
             save_checkpoint(model, epoch, args.checkpoint_dir)
         if epoch >= pseudo_start_epoch:
             pseudo_weight = args.pseudo_weight
     writer.close()
+    if not args.no_wandb:
+        wandb.finish()
 
 def pseudo_label_adverbs(model, features, actions, pad, num, method, threshold=0, adverb_thresholds=None):
     threshold_mask = torch.ones((num, actions.shape[0]), dtype=torch.bool)
@@ -141,7 +159,7 @@ def pseudo_label_adverbs(model, features, actions, pad, num, method, threshold=0
     return pseudo_adverbs, unlabelled_neg_adverbs, threshold_mask, attention, conf[0]
 
 
-def train(model, train_loader, optimizer, writer, epoch, unlabelled_ratio, pseudo_loss_factor, pseudo_always_action, num_pseudo, pseudo_selection, adverb_thresholds):
+def train(model, train_loader, optimizer, writer, epoch, unlabelled_ratio, pseudo_loss_factor, pseudo_always_action, num_pseudo, pseudo_selection, adverb_thresholds, args):
     model.train()
     train_loss = 0.0
     act_loss = 0.0
@@ -207,6 +225,17 @@ def train(model, train_loader, optimizer, writer, epoch, unlabelled_ratio, pseud
         act_loss += all_loss[0].item()
         adv_loss += all_loss[1].item() ##should be introduced after action mods have started training
 
+        # Log step-level metrics to wandb
+        if not args.no_wandb:
+            step_wandb_log = {
+                'step/loss_total': loss.item(),
+                'step/loss_action': all_loss[0].item(),
+                'step/loss_adverb': all_loss[1].item(),
+            }
+            if args.unlabelled_ratio > 0 and (pseudo_loss_factor > 0 or pseudo_always_action) and pseudo_loss > 0:
+                step_wandb_log['step/loss_pseudo'] = pseudo_loss.item() / pseudo_labelled_adverbs.shape[0]
+            wandb.log(step_wandb_log)
+
         batch_time.update(time.time() - start - data_time.val)
         start = time.time()
         if epoch == 0:
@@ -237,6 +266,24 @@ def train(model, train_loader, optimizer, writer, epoch, unlabelled_ratio, pseud
     writer.add_scalar('Loss/Train/PseudoTotal', pseudo_train_loss, epoch)
     writer.add_scalar('Loss/Train/PseudoAction', pseudo_act_loss, epoch)
     writer.add_scalar('Loss/Train/PseudoAdverb', pseudo_adv_loss, epoch)
+    
+    # Log to wandb
+    if not args.no_wandb:
+        wandb_log = {
+            'epoch': epoch,
+            'train/loss_total': train_loss,
+            'train/loss_action': act_loss,
+            'train/loss_adverb': adv_loss,
+            'train/loss_pseudo_total': pseudo_train_loss,
+            'train/loss_pseudo_action': pseudo_act_loss,
+            'train/loss_pseudo_adverb': pseudo_adv_loss,
+            'train/batch_time': batch_time.avg,
+            'train/data_time': data_time.avg,
+            'manifold_type': args.manifold
+        }
+        if args.unlabelled_ratio > 0 and (pseudo_loss_factor > 0 or pseudo_always_action):
+            wandb_log['train/pseudo_above_threshold'] = threshold_mask.sum().item()
+        wandb.log(wandb_log)
 
     if epoch == 0:
         writer.add_histogram('TrainLabelDist', all_train_labels, epoch)
@@ -244,7 +291,7 @@ def train(model, train_loader, optimizer, writer, epoch, unlabelled_ratio, pseud
     gc.collect()
     return adverb_thresholds
 
-def test(model, test_loader, evaluator, writer, epoch):
+def test(model, test_loader, evaluator, writer, epoch, args):
     model.eval()
     accuracies = []
     all_antonym_action_gt_scores = torch.Tensor()
@@ -262,6 +309,13 @@ def test(model, test_loader, evaluator, writer, epoch):
     acc_mean = calculate_mean_p1(model.dset, all_antonym_action_gt_scores, all_adverb_gt)
     writer.add_scalar('Acc/Test/Video-to-Adverb Antonym', sum(accuracies)/len(accuracies), epoch)
     writer.add_scalar('Acc/Test/Video-to-Adverb Antonym Mean', acc_mean, epoch)
+    
+    # Log test metrics to wandb
+    if not args.no_wandb:
+        wandb.log({
+            'test/video_to_adverb_antonym_acc': sum(accuracies)/len(accuracies),
+            'test/video_to_adverb_antonym_mean': acc_mean
+        })
 
 def calculate_p1_action(dset, scores, action_gt):
     pair_pred = np.argmax(scores.numpy(), axis=1)
