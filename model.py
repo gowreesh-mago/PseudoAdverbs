@@ -111,7 +111,7 @@ class ActionModifiers(nn.Module):
             self.poincare_ball = PoincareBall(c=Curvature(value=self.curvature))
 
         if args.glove_init:
-            pretrained_weight = load_word_embeddings('data/glove.6B.300d.txt', dset.actions)
+            pretrained_weight = load_word_embeddings('/ivi/xfs/gmago/action_adverbs/glove.6B.300d.txt', dset.actions)
             self.action_embedder.weight.data.copy_(pretrained_weight)
 
         for param in self.action_embedder.parameters():
@@ -178,9 +178,6 @@ class ActionModifiers(nn.Module):
             positive_h = self.poincare_ball.expmap(TangentTensor(data=positive, man_dim=1, manifold=self.poincare_ball))
             negative_act_h = self.poincare_ball.expmap(TangentTensor(data=negative_act, man_dim=1, manifold=self.poincare_ball))
             negative_adv_h = self.poincare_ball.expmap(TangentTensor(data=negative_adv, man_dim=1, manifold=self.poincare_ball))
-
-        
-        if self.manifold == 'hyperbolic':
             loss_triplet_act = self.hyperbolic_triplet_margin_loss(video_embedding_h, positive_h, negative_act_h, margin=self.margin)
         else:
             loss_triplet_act = F.triplet_margin_loss(video_embedding, positive, negative_act, margin=self.margin)
@@ -202,7 +199,7 @@ class ActionModifiers(nn.Module):
             else:
                 loss_triplet_adv = F.triplet_margin_loss(video_embedding, positive, negative_adv, margin=self.margin)
         loss = [loss_triplet_act, loss_triplet_adv]
-        return loss, None, attention_weights, video_embedding
+        return loss, None, attention_weights, video_embedding if self.manifold=='euclidean' else video_embedding_h
 
     def val_forward(self, x, attention=None):
         features = x[0]
@@ -229,9 +226,14 @@ class ActionModifiers(nn.Module):
         for i, (adverb, action) in enumerate(self.dset.pairs):
             pair_embedding = action_adverb_embeddings[i, None].expand(batch_size,
                                                                       action_adverb_embeddings.size(1))
-            score = self.compare_metric(video_embedding, pair_embedding)
+            if self.manifold == 'hyperbolic':
+                video_embedding_h = self.poincare_ball.expmap(TangentTensor(data=video_embedding, man_dim=1, manifold=self.poincare_ball))
+                pair_embedding_h = self.poincare_ball.expmap(TangentTensor(data=pair_embedding, man_dim=1, manifold=self.poincare_ball))
+                score = self.compare_metric(video_embedding_h, pair_embedding_h)
+            else:
+                score = self.compare_metric(video_embedding, pair_embedding)
             scores[(adverb, action)] = score
-        return None, scores, attention_weights, video_embedding
+        return None, scores, attention_weights, video_embedding if self.manifold=='euclidean' else video_embedding_h
 
     def forward(self, x, threshold_adverbs=None, attention=None):
         if self.training:
@@ -245,20 +247,20 @@ class Evaluator:
     def __init__(self, dset, model):
         self.dset = dset
         pairs = [(dset.adverb2idx[adv.strip()], dset.action2idx[act]) for adv, act in dset.pairs]
-        self.pairs = torch.LongTensor(pairs)
+        self.pairs = torch.LongTensor(pairs).cuda()
 
         ## mask over pairs for ground-truth action given in testing
         action_gt_mask = []
         for _act in dset.actions:
             mask = [1 if _act==act else 0 for adv, act in dset.pairs]
             action_gt_mask.append(torch.BoolTensor(mask))
-        self.action_gt_mask = torch.stack(action_gt_mask, 0)
+        self.action_gt_mask = torch.stack(action_gt_mask, 0).cuda()
 
         antonym_mask = []
         for _adv in dset.adverbs:
             mask = [1 if (_adv==adv or _adv==dset.antonyms[adv]) else 0 for adv, act in dset.pairs]
             antonym_mask.append(torch.BoolTensor(mask))
-        self.antonym_mask = torch.stack(antonym_mask, 0)
+        self.antonym_mask = torch.stack(antonym_mask, 0).cuda()
 
     def get_gt_action_scores(self, scores, action_gt):
         mask = self.action_gt_mask[action_gt]
@@ -279,9 +281,6 @@ class Evaluator:
         return action_gt_antonym_scores
 
     def get_scores(self, scores, action_gt, adverb_gt):
-        scores = {k:v.cpu() for k, v in scores.items()}
-        action_gt = action_gt.cpu()
-
         scores = torch.stack([scores[(adv, act)] for adv, act in self.dset.pairs], 1)
         action_gt_scores = self.get_gt_action_scores(scores, action_gt)
         antonym_action_gt_scores = self.get_gt_action_antonym_scores(scores, action_gt, adverb_gt)

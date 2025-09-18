@@ -299,7 +299,7 @@ def train(model, train_loader, optimizer, writer, epoch, unlabelled_ratio, pseud
 def test(model, test_loader, evaluator, writer, epoch, args):
     model.eval()
     accuracies = []
-    all_antonym_action_gt_scores = torch.Tensor()
+    all_antonym_action_gt_scores = torch.Tensor().cuda()
     all_adverb_gt = torch.Tensor().cuda()
     for idx, data in tqdm.tqdm(enumerate(test_loader), total=len(test_loader)):
         data = [d.cuda() for d in data]
@@ -308,10 +308,10 @@ def test(model, test_loader, evaluator, writer, epoch, args):
         scores, action_gt_scores, antonym_action_gt_scores = evaluator.get_scores(predictions, action_gt, adverb_gt)
         all_antonym_action_gt_scores = torch.cat([all_antonym_action_gt_scores, antonym_action_gt_scores])
         all_adverb_gt = torch.cat([all_adverb_gt, adverb_gt])
-        acc = calculate_p1(model.dset, antonym_action_gt_scores, adverb_gt)
+        acc = calculate_p1(model.dset, antonym_action_gt_scores.cpu(), adverb_gt.cpu())
         print('E %d | Video-to-Adverb Antonym P@1: %.3f'%(epoch, acc))
         accuracies.append(acc)
-    acc_mean = calculate_mean_p1(model.dset, all_antonym_action_gt_scores, all_adverb_gt)
+    acc_mean = calculate_mean_p1(model.dset, all_antonym_action_gt_scores.cpu(), all_adverb_gt.cpu())
     writer.add_scalar('Acc/Test/Video-to-Adverb Antonym', sum(accuracies)/len(accuracies), epoch)
     writer.add_scalar('Acc/Test/Video-to-Adverb Antonym Mean', acc_mean, epoch)
     
