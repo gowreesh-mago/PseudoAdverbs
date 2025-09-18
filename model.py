@@ -111,7 +111,7 @@ class ActionModifiers(nn.Module):
             self.poincare_ball = PoincareBall(c=Curvature(value=self.curvature))
 
         if args.glove_init:
-            pretrained_weight = load_word_embeddings('/ivi/xfs/gmago/action_adverbs/glove.6B.300d.txt', dset.actions)
+            pretrained_weight = load_word_embeddings(args.glove_path, dset.actions)
             self.action_embedder.weight.data.copy_(pretrained_weight)
 
         for param in self.action_embedder.parameters():

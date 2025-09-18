@@ -33,8 +33,6 @@ def main(args):
     )
     
 
-    # Log manifold type
-    print(f"Training on {args.manifold} manifold")
 
     train_set = AdverbDataset(args.data_dir, args.train_feature_dir, agg=args.temporal_agg,
                               modality=args.modality, window_size=args.t_train,
