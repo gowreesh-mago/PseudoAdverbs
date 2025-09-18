@@ -2,3 +2,4 @@
 *ipynb
 __pycache__/
 checkpoints/
+wandb_config.json
