@@ -3,6 +3,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from hypll.manifolds.poincare_ball import PoincareBall, Curvature
+from hypll.tensors import TangentTensor
 
 def load_word_embeddings(emb_file, vocab):
     vocab = [word.lower() for word in vocab]
@@ -100,6 +102,13 @@ class ActionModifiers(nn.Module):
         self.action_modifiers = nn.ParameterList([nn.Parameter(torch.eye(args.emb_dim))
                                             for _ in range(len(dset.adverbs))])
         self.action_embedder = nn.Embedding(len(dset.actions), args.emb_dim)
+        self.manifold = 'euclidean'
+        if args.manifold =='hyperbolic':
+            self.curvature = args.curvature
+            self.manifold = 'hyperbolic'
+            if args.train_curvature:
+                self.poincare_ball = PoincareBall(c=Curvature(value=self.curvature,requires_grad=True))
+            self.poincare_ball = PoincareBall(c=Curvature(value=self.curvature))
 
         if args.glove_init:
             pretrained_weight = load_word_embeddings('data/glove.6B.300d.txt', dset.actions)
@@ -112,8 +121,10 @@ class ActionModifiers(nn.Module):
         self.transformer = False
         if args.temporal_agg == 'sdp':
             self.transformer = True
-
-        self.compare_metric = lambda vid_feats, act_adv_embed: -F.pairwise_distance(vid_feats, act_adv_embed)
+        if self.manifold == 'hyperbolic':
+            self.compare_metric = lambda vid_feats, act_adv_embed: -self.hyperbolic_distance(vid_feats, act_adv_embed)
+        else:
+            self.compare_metric = lambda vid_feats, act_adv_embed: -F.pairwise_distance(vid_feats, act_adv_embed)
         self.dset = dset
 
         ## precompute validation pairs
@@ -121,11 +132,21 @@ class ActionModifiers(nn.Module):
         self.val_adverbs = torch.LongTensor([dset.adverb2idx[adv.strip()] for adv in adverbs]).cuda()
         self.adverbs = torch.LongTensor([dset.adverb2idx[adv.strip()] for adv in self.dset.adverbs]).cuda()
         self.val_actions = torch.LongTensor([dset.action2idx[act.strip()] for act in actions]).cuda()
-
+        
     def apply_modifiers(self, modifiers, embedding):
         output = torch.bmm(modifiers, embedding.unsqueeze(2)).squeeze(2)
         output = F.relu(output)
         return output
+    
+    def hyperbolic_distance(self, x, y):
+        return self.poincare_ball.dist(x, y)
+    
+    def hyperbolic_triplet_margin_loss(self, anchor, positive, negative, margin=1.0):
+        dist_pos = self.hyperbolic_distance(anchor, positive)
+        dist_neg = self.hyperbolic_distance(anchor, negative)
+        loss = F.relu(dist_pos - dist_neg + margin)
+        return loss.mean()
+        
 
     def train_forward(self, x, threshold_adverbs=None, attention=None):
         features, adverbs, actions = x[0], x[1], x[2]
@@ -152,18 +173,34 @@ class ActionModifiers(nn.Module):
         neg_modifiers = torch.stack([self.action_modifiers[adv.item()] for adv in neg_adverbs])
         negative_adv = self.apply_modifiers(neg_modifiers, action_embedding)
 
-        loss_triplet_act = F.triplet_margin_loss(video_embedding, positive, negative_act, margin=self.margin)
+        if self.manifold == 'hyperbolic':
+            video_embedding_h = self.poincare_ball.expmap(TangentTensor(data=video_embedding, man_dim=1, manifold=self.poincare_ball))
+            positive_h = self.poincare_ball.expmap(TangentTensor(data=positive, man_dim=1, manifold=self.poincare_ball))
+            negative_act_h = self.poincare_ball.expmap(TangentTensor(data=negative_act, man_dim=1, manifold=self.poincare_ball))
+            negative_adv_h = self.poincare_ball.expmap(TangentTensor(data=negative_adv, man_dim=1, manifold=self.poincare_ball))
+
+        
+        if self.manifold == 'hyperbolic':
+            loss_triplet_act = self.hyperbolic_triplet_margin_loss(video_embedding_h, positive_h, negative_act_h, margin=self.margin)
+        else:
+            loss_triplet_act = F.triplet_margin_loss(video_embedding, positive, negative_act, margin=self.margin)
         if threshold_adverbs is not None:
             if threshold_adverbs.sum() == 0:
                 loss_triplet_adv = torch.tensor(0)
                 if threshold_adverbs.is_cuda:
                     loss_triplet_adv = loss_triplet_adv.cuda()
             else:
-                loss_triplet_adv_all = F.triplet_margin_loss(video_embedding, positive, negative_adv, margin=self.margin, reduce=False)
+                if self.manifold == 'hyperbolic':
+                    loss_triplet_adv_all = self.hyperbolic_triplet_margin_loss(video_embedding_h, positive_h, negative_adv_h, margin=self.margin, reduce=False)
+                else:
+                    loss_triplet_adv_all = F.triplet_margin_loss(video_embedding, positive, negative_adv, margin=self.margin, reduce=False)
                 loss_triplet_adv_all[~threshold_adverbs] = 0
                 loss_triplet_adv = loss_triplet_adv_all.sum()/threshold_adverbs.sum()
         else:
-            loss_triplet_adv = F.triplet_margin_loss(video_embedding, positive, negative_adv, margin=self.margin)
+            if self.manifold == 'hyperbolic':
+                loss_triplet_adv = self.hyperbolic_triplet_margin_loss(video_embedding_h, positive_h, negative_adv_h, margin=self.margin)
+            else:
+                loss_triplet_adv = F.triplet_margin_loss(video_embedding, positive, negative_adv, margin=self.margin)
         loss = [loss_triplet_act, loss_triplet_adv]
         return loss, None, attention_weights, video_embedding
 

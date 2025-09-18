@@ -13,6 +13,7 @@ from dataset import AdverbDataset
 from model import ActionModifiers, Evaluator
 from wandb_config import init_wandb_with_config
 import wandb
+from hypll.optim import RiemannianAdam
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -69,7 +70,10 @@ def main(args):
     else:
         optim_params = [{'name': 'action_modifiers', 'params': modifier_params, 'lr':0},
                         {'name': 'embedding', 'params': other_params}]
-    optimizer = optim.Adam(optim_params, lr=args.lr, weight_decay=args.wd)
+    if args.manifold == 'hyperbolic':
+        optimizer = RiemannianAdam(optim_params, lr=args.lr, weight_decay=args.wd)
+    else:
+        optimizer = optim.Adam(optim_params, lr=args.lr, weight_decay=args.wd)
 
     start_epoch = 0
     if args.load is not None:
@@ -92,6 +96,7 @@ def main(args):
     else:
         pseudo_weight = 0.0
     test(model, test_loader, evaluator, writer, start_epoch, args)
+    print('Training on {} manifold', args.manifold)
     for epoch in range(start_epoch, start_epoch+args.max_epochs+1):
         if args.pretrain_action and epoch == args.adverb_start:
             introduce_adverbs(optimizer, args.lr)
