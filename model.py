@@ -102,7 +102,7 @@ class ActionModifiers(nn.Module):
         self.action_embedder = nn.Embedding(len(dset.actions), args.emb_dim)
 
         if args.glove_init:
-            pretrained_weight = load_word_embeddings('data/glove.6B.300d.txt', dset.actions)
+            pretrained_weight = load_word_embeddings(args.glove_path, dset.actions)
             self.action_embedder.weight.data.copy_(pretrained_weight)
 
         for param in self.action_embedder.parameters():
@@ -208,20 +208,20 @@ class Evaluator:
     def __init__(self, dset, model):
         self.dset = dset
         pairs = [(dset.adverb2idx[adv.strip()], dset.action2idx[act]) for adv, act in dset.pairs]
-        self.pairs = torch.LongTensor(pairs)
+        self.pairs = torch.LongTensor(pairs).cuda()
 
         ## mask over pairs for ground-truth action given in testing
         action_gt_mask = []
         for _act in dset.actions:
             mask = [1 if _act==act else 0 for adv, act in dset.pairs]
             action_gt_mask.append(torch.BoolTensor(mask))
-        self.action_gt_mask = torch.stack(action_gt_mask, 0)
+        self.action_gt_mask = torch.stack(action_gt_mask, 0).cuda()
 
         antonym_mask = []
         for _adv in dset.adverbs:
             mask = [1 if (_adv==adv or _adv==dset.antonyms[adv]) else 0 for adv, act in dset.pairs]
             antonym_mask.append(torch.BoolTensor(mask))
-        self.antonym_mask = torch.stack(antonym_mask, 0)
+        self.antonym_mask = torch.stack(antonym_mask, 0).cuda()
 
     def get_gt_action_scores(self, scores, action_gt):
         mask = self.action_gt_mask[action_gt]
@@ -242,9 +242,6 @@ class Evaluator:
         return action_gt_antonym_scores
 
     def get_scores(self, scores, action_gt, adverb_gt):
-        scores = {k:v.cpu() for k, v in scores.items()}
-        action_gt = action_gt.cpu()
-
         scores = torch.stack([scores[(adv, act)] for adv, act in self.dset.pairs], 1)
         action_gt_scores = self.get_gt_action_scores(scores, action_gt)
         antonym_action_gt_scores = self.get_gt_action_antonym_scores(scores, action_gt, adverb_gt)

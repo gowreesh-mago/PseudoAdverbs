@@ -55,3 +55,4 @@ parser.add_argument('--instance-av', default=False, action='store_true', help='T
 parser.add_argument('--wandb_config', type=str, default=None, help='Path to wandb configuration file (JSON or YAML) containing API key and other settings')
 parser.add_argument('--wandb-run-name', type=str, default='euclidean')
 parser.add_argument('--no-wandb', action='store_true', default=False, help='Disable wandb logging')
+parser.add_argument('--glove-path', type=str, default='glove.6B.300d.txt', help='Path to GloVe embeddings file')
