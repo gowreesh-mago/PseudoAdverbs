@@ -55,5 +55,6 @@ parser.add_argument('--instance-av', default=False, action='store_true', help='T
 parser.add_argument('--wandb_config', type=str, default=None, help='Path to wandb configuration file (JSON or YAML) containing API key and other settings')
 parser.add_argument('--wandb-run-name', type=str, default='euclidean')
 parser.add_argument('--no-wandb', action='store_true', default=False, help='Disable wandb logging')
-parser.add_argument('--manifold', type=str, default='euclidean', choices=['euclidean', 'hyperbolic',], help='Type of manifold to use for embeddings')
+parser.add_argument('--manifold', type=str, default='hyperbolic', choices=['euclidean', 'hyperbolic',], help='Type of manifold to use for embeddings')
 parser.add_argument('--curvature', type=float, default=1.0, help='Curvature for hyperbolic manifold (only if manifold is hyperbolic)')
+parser.add_argument('--train_curvature', action='store_true', default=False, help='Whether to train the curvature parameter (only if manifold is hyperbolic)')
