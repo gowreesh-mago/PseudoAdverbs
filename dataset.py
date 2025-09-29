@@ -15,7 +15,8 @@ class AdverbDataset(data.Dataset):
                  load_in_memory=True, unlabelled_ratio=0,
                  train_file='train.csv',
                  test_file='test.csv', unlabelled_file='unlabelled.csv',
-                 unlabelled_feature_dir=None):
+                 unlabelled_feature_dir=None,
+                 classification_mode=False, class_mode='present_only'):
         self.train_file = train_file
         self.test_file = test_file
         self.unlabelled_file = unlabelled_file
@@ -34,6 +35,8 @@ class AdverbDataset(data.Dataset):
         self.all_info = all_info
         self.load_in_memory = load_in_memory
         self.unlabelled_ratio = unlabelled_ratio
+        self.classification_mode = classification_mode
+        self.class_mode = class_mode
 
         if self.unlabelled_ratio > 0:
             self.adverbs, self.actions, self.train_list, self.test_list, self.unlabelled_list = self._parse_list(adverb_filter)
@@ -43,6 +46,10 @@ class AdverbDataset(data.Dataset):
         self.adverbs, self.antonyms = self._add_antonyms(self.adverbs) ## antonyms necessary for training
 
         self.pairs = list(itertools.product(self.adverbs, self.actions))
+
+        # Classification-specific setup
+        if self.classification_mode:
+            self._setup_classification_classes()
         if self.unlabelled_ratio > 0:
             self.unlabelled_pairs = list(set(list(self.unlabelled_list[['clustered_action', 'clustered_adverb']].itertuples(index=False, name=None))))
             for pair in self.unlabelled_pairs:
@@ -184,6 +191,40 @@ class AdverbDataset(data.Dataset):
             antonyms[row['adverb']] = row['antonym']
         return adverbs, antonyms
 
+    def _setup_classification_classes(self):
+        """Setup classification classes and mappings."""
+        if self.class_mode == 'present_only':
+            # Only use action-adverb pairs present in training data
+            train_pairs = set([(row[self.action_key], row[self.adverb_key])
+                              for _, row in self.train_list.iterrows()])
+            self.class_pairs = sorted(list(train_pairs))
+        elif self.class_mode == 'all_classes':
+            # Use all possible action-adverb combinations + antonyms
+            all_pairs = set()
+            # Add all combinations from training data
+            for _, row in self.train_list.iterrows():
+                action, adverb = row[self.action_key], row[self.adverb_key]
+                all_pairs.add((action, adverb))
+                # Add antonym pair if available
+                if adverb in self.antonyms:
+                    all_pairs.add((action, self.antonyms[adverb]))
+
+            # Add all test combinations too
+            for _, row in self.test_list.iterrows():
+                action, adverb = row[self.action_key], row[self.adverb_key]
+                all_pairs.add((action, adverb))
+                if adverb in self.antonyms:
+                    all_pairs.add((action, self.antonyms[adverb]))
+
+            self.class_pairs = sorted(list(all_pairs))
+
+        # Create mappings
+        self.class2idx = {pair: idx for idx, pair in enumerate(self.class_pairs)}
+        self.idx2class = {idx: pair for pair, idx in self.class2idx.items()}
+        self.num_classes = len(self.class_pairs)
+
+        print(f"Classification setup: {self.num_classes} classes in {self.class_mode} mode")
+
     def _parse_list(self, adverb_filter):
         def parse_pairs(filename):
             pairs_df = pd.read_csv(filename)
@@ -233,33 +274,59 @@ class AdverbDataset(data.Dataset):
         else:
             ind_data = self.data.iloc[index]
             item_feature = self._load_single_feature(index, ind_data, self.feature_dir)
-        if self.unlabelled_ratio > 0:
-            unlabelled_inds = [random.randint(0, len(self.unlabelled_list)-1) for i in range(0, self.unlabelled_ratio)]
-            if self.load_in_memory:
-                unlabelled_features = [self.unlabelled_feature_list[u_ind] for u_ind in unlabelled_inds]
-            else:
-                inds_data = [self.unlabelled_list.iloc[u_ind] for u_ind in unlabelled_inds]
-                unlabelled_features = [self._load_single_feature(unlabelled_inds[i], inds_data[i], self.unlabelled_feature_dir) for i in range(0, self.unlabelled_ratio)]
+
         feature, adverb, action = item_feature[0:3]
-        data = [feature, self.adverb2idx[adverb], self.action2idx[action]]
-        if self.agg == 'sdp':
-            pad = item_feature[4]
-            data += [pad]
+
+        if self.classification_mode:
+            # Classification mode: return features and class label
+            class_pair = (action, adverb)
+            if class_pair in self.class2idx:
+                class_label = self.class2idx[class_pair]
+            else:
+                # Handle unseen pairs (shouldn't happen in present_only mode)
+                class_label = -1  # Will be filtered out during training
+
+            data = [feature, class_label]
+            if self.agg == 'sdp':
+                pad = item_feature[4]
+                data += [pad]
+            else:
+                data += [0]
+
+            if self.all_info:
+                clip_id = item_feature[3]
+                data += [clip_id, action, adverb]
+
         else:
-            data += [0]
-        if self.phase == 'train':
-            neg_adverb = self.adverb2idx[self.antonyms[adverb]]
-            neg_action = self.action2idx[self.sample_negative_action(action)]
-            data += [neg_adverb, neg_action]
+            # Original metric learning mode
             if self.unlabelled_ratio > 0:
-                u_feats = np.array([u_feature[0] for u_feature in unlabelled_features])
-                u_acts = np.array([self.action2idx[u_feature[2]] for u_feature in unlabelled_features])
-                u_pad = np.array([u_feature[4] for u_feature in unlabelled_features])
-                u_neg_acts = np.array([self.action2idx[self.sample_negative_action(u_feature[2])] for u_feature in unlabelled_features])
-                data += [u_feats, u_acts, u_pad, u_neg_acts]
-        if self.all_info:
-            clip_id = item_feature[3]
-            data += [clip_id]
+                unlabelled_inds = [random.randint(0, len(self.unlabelled_list)-1) for i in range(0, self.unlabelled_ratio)]
+                if self.load_in_memory:
+                    unlabelled_features = [self.unlabelled_feature_list[u_ind] for u_ind in unlabelled_inds]
+                else:
+                    inds_data = [self.unlabelled_list.iloc[u_ind] for u_ind in unlabelled_inds]
+                    unlabelled_features = [self._load_single_feature(unlabelled_inds[i], inds_data[i], self.unlabelled_feature_dir) for i in range(0, self.unlabelled_ratio)]
+
+            data = [feature, self.adverb2idx[adverb], self.action2idx[action]]
+            if self.agg == 'sdp':
+                pad = item_feature[4]
+                data += [pad]
+            else:
+                data += [0]
+            if self.phase == 'train':
+                neg_adverb = self.adverb2idx[self.antonyms[adverb]]
+                neg_action = self.action2idx[self.sample_negative_action(action)]
+                data += [neg_adverb, neg_action]
+                if self.unlabelled_ratio > 0:
+                    u_feats = np.array([u_feature[0] for u_feature in unlabelled_features])
+                    u_acts = np.array([self.action2idx[u_feature[2]] for u_feature in unlabelled_features])
+                    u_pad = np.array([u_feature[4] for u_feature in unlabelled_features])
+                    u_neg_acts = np.array([self.action2idx[self.sample_negative_action(u_feature[2])] for u_feature in unlabelled_features])
+                    data += [u_feats, u_acts, u_pad, u_neg_acts]
+            if self.all_info:
+                clip_id = item_feature[3]
+                data += [clip_id]
+
         return data
 
     def __len__(self):

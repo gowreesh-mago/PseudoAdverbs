@@ -10,7 +10,7 @@ from utils import save_args, introduce_adverbs, save_checkpoint, calculate_p1, c
 
 from opts import parser
 from dataset import AdverbDataset
-from model import ActionModifiers, Evaluator
+from model import ActionModifiers, Evaluator, ActionAdverbClassifier, ClassificationEvaluator
 from wandb_config import init_wandb_with_config
 import wandb
 
@@ -38,7 +38,9 @@ def main(args):
                               adverb_filter=args.adverb_filter, phase='train',
                               load_in_memory=args.load_in_memory,
                               unlabelled_ratio=args.unlabelled_ratio,
-                              unlabelled_feature_dir=args.unlabelled_feature_dir)
+                              unlabelled_feature_dir=args.unlabelled_feature_dir,
+                              classification_mode=args.classification_mode,
+                              class_mode=args.class_mode)
     train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
                                               num_workers=args.workers)
     test_set = AdverbDataset(args.data_dir, args.test_feature_dir, agg=args.temporal_agg,
@@ -46,28 +48,39 @@ def main(args):
                              adverb_filter=args.adverb_filter, phase='test',
                              load_in_memory=args.load_in_memory,
                              unlabelled_ratio=args.unlabelled_ratio,
-                             unlabelled_feature_dir=args.unlabelled_feature_dir)
+                             unlabelled_feature_dir=args.unlabelled_feature_dir,
+                             classification_mode=args.classification_mode,
+                             class_mode=args.class_mode)
     test_loader = torch.utils.data.DataLoader(test_set, batch_size=args.batch_size, shuffle=False,
                                               num_workers=args.workers)
 
-    model = ActionModifiers(train_set, args).cuda()
-    adverb_thresholds = None
-    if args.adaptive_threshold:
-        adverb_thresholds = torch.Tensor([args.pseudo_label_threshold]*len(model.dset.adverb2idx.keys())).cuda()
-
-    evaluator = Evaluator(train_set, model)
-
-    modifier_params = [param for name, param in model.named_parameters()
-                       if ('action_modifiers' in name) and param.requires_grad]
-    other_params = [param for name, param in model.named_parameters()
-                    if ('action_modifiers' not in name) and param.requires_grad]
-    if not args.pretrain_action:
-        optim_params = [{'name': 'action_modifiers', 'params': modifier_params},
-                        {'name': 'embedding', 'params': other_params}]
+    if args.classification_mode:
+        model = ActionAdverbClassifier(train_set, args).cuda()
+        evaluator = ClassificationEvaluator(train_set)
+        criterion = torch.nn.CrossEntropyLoss()
     else:
-        optim_params = [{'name': 'action_modifiers', 'params': modifier_params, 'lr':0},
-                        {'name': 'embedding', 'params': other_params}]
-    optimizer = optim.Adam(optim_params, lr=args.lr, weight_decay=args.wd)
+        model = ActionModifiers(train_set, args).cuda()
+        evaluator = Evaluator(train_set, model)
+        adverb_thresholds = None
+        if args.adaptive_threshold:
+            adverb_thresholds = torch.Tensor([args.pseudo_label_threshold]*len(model.dset.adverb2idx.keys())).cuda()
+
+    if args.classification_mode:
+        # Simple optimizer for classification mode
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    else:
+        # Original optimizer setup for metric learning mode
+        modifier_params = [param for name, param in model.named_parameters()
+                           if ('action_modifiers' in name) and param.requires_grad]
+        other_params = [param for name, param in model.named_parameters()
+                        if ('action_modifiers' not in name) and param.requires_grad]
+        if not args.pretrain_action:
+            optim_params = [{'name': 'action_modifiers', 'params': modifier_params},
+                            {'name': 'embedding', 'params': other_params}]
+        else:
+            optim_params = [{'name': 'action_modifiers', 'params': modifier_params, 'lr':0},
+                            {'name': 'embedding', 'params': other_params}]
+        optimizer = optim.Adam(optim_params, lr=args.lr, weight_decay=args.wd)
 
     start_epoch = 0
     if args.load is not None:
@@ -85,21 +98,33 @@ def main(args):
     pseudo_weight = args.pseudo_weight
     pseudo_always_action = args.pseudo_action_pretraining
 
-    if args.pretrain_action:
-        pseudo_weight = 0.0
+    if args.classification_mode:
+        # Classification training loop
+        test_classification(model, test_loader, evaluator, criterion, writer, start_epoch, args)
+        for epoch in range(start_epoch, start_epoch+args.max_epochs+1):
+            train_classification(model, train_loader, optimizer, criterion, writer, epoch, args)
+            if epoch % args.eval_interval == 0:
+                test_classification(model, test_loader, evaluator, criterion, writer, epoch, args)
+            if epoch % args.save_interval == 0 and epoch > 0:
+                save_checkpoint(model, epoch, args.checkpoint_dir)
+        
     else:
-        pseudo_weight = 0.0
-    test(model, test_loader, evaluator, writer, start_epoch, args)
-    for epoch in range(start_epoch, start_epoch+args.max_epochs+1):
-        if args.pretrain_action and epoch == args.adverb_start:
-            introduce_adverbs(optimizer, args.lr)
-        adverb_thresholds = train(model, train_loader, optimizer, writer, epoch, args.unlabelled_ratio, pseudo_weight, pseudo_always_action, args.num_pseudo_labelled, args.pseudo_selection, adverb_thresholds, args)
-        if epoch % args.eval_interval == 0:
-            test(model, test_loader, evaluator, writer, epoch, args)
-        if epoch % args.save_interval == 0 and epoch > 0:
-            save_checkpoint(model, epoch, args.checkpoint_dir)
-        if epoch >= pseudo_start_epoch:
-            pseudo_weight = args.pseudo_weight
+        # Original metric learning training loop
+        if args.pretrain_action:
+            pseudo_weight = 0.0
+        else:
+            pseudo_weight = 0.0
+        test(model, test_loader, evaluator, writer, start_epoch, args)
+        for epoch in range(start_epoch, start_epoch+args.max_epochs+1):
+            if args.pretrain_action and epoch == args.adverb_start:
+                introduce_adverbs(optimizer, args.lr)
+            adverb_thresholds = train(model, train_loader, optimizer, writer, epoch, args.unlabelled_ratio, pseudo_weight, pseudo_always_action, args.num_pseudo_labelled, args.pseudo_selection, adverb_thresholds, args)
+            if epoch % args.eval_interval == 0:
+                test(model, test_loader, evaluator, writer, epoch, args)
+            if epoch % args.save_interval == 0 and epoch > 0:
+                save_checkpoint(model, epoch, args.checkpoint_dir)
+            if epoch >= pseudo_start_epoch:
+                pseudo_weight = args.pseudo_weight
     writer.close()
     if not args.no_wandb:
         wandb.finish()
@@ -314,6 +339,117 @@ def test(model, test_loader, evaluator, writer, epoch, args):
             'test/video_to_adverb_antonym_acc': sum(accuracies)/len(accuracies),
             'test/video_to_adverb_antonym_mean': acc_mean
         })
+
+def train_classification(model, train_loader, optimizer, criterion, writer, epoch, args):
+    """Training function for classification mode."""
+    model.train()
+    total_loss = 0.0
+    total_acc = 0.0
+    num_batches = 0
+
+    for idx, data in tqdm.tqdm(enumerate(train_loader), total=len(train_loader)):
+        features = data[0].cuda()
+        labels = data[1].cuda()
+
+        if len(data) > 2:  # SDP mode with padding
+            pad = data[2].cuda()
+            model_input = [features, labels, pad]
+        else:
+            model_input = [features, labels]
+
+        logits, _ = model(model_input)
+        loss = criterion(logits, labels)
+
+        predictions = torch.argmax(logits, dim=1)
+        total_correct = (predictions == labels).sum().item()
+        total_samples = labels.size(0)
+        accuracy = (predictions == labels).float().mean()
+
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        total_acc += accuracy.item()
+        num_batches += 1
+
+        # Log step-level metrics to wandb
+        if not args.no_wandb:
+            step_wandb_log = {
+                'step/classification_loss': loss.item(),
+                'step/classification_accuracy': accuracy.item(),
+            }
+            wandb.log(step_wandb_log)
+
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0
+    avg_acc = total_correct / total_samples if num_batches > 0 else 0
+
+    writer.add_scalar('Loss/Train/Classification', avg_loss, epoch)
+    writer.add_scalar('Acc/Train/Classification', avg_acc, epoch)
+
+    # Log to wandb
+    if not args.no_wandb:
+        wandb.log({
+            'epoch': epoch,
+            'train/classification_loss': avg_loss,
+            'train/classification_accuracy': avg_acc,
+        })
+
+    print(f'E: {epoch} | Classification Loss: {avg_loss:.4f} | Accuracy: {avg_acc:.4f}')
+
+def test_classification(model, test_loader, evaluator, criterion, writer, epoch, args):
+    """Testing function for classification mode."""
+    model.eval()
+    total_loss = 0.0
+    all_logits = []
+    all_labels = []
+
+    with torch.no_grad():
+        for idx, data in tqdm.tqdm(enumerate(test_loader), total=len(test_loader)):
+            features = data[0].cuda()
+            labels = data[1].cuda()
+
+
+            if len(data) > 2:  # SDP mode with padding
+                pad = data[2].cuda()
+                model_input = [features, labels, pad]
+            else:
+                model_input = [features, labels]
+
+            logits, _ = model(model_input)
+            loss = criterion(logits, labels)
+
+            total_loss += loss.item()
+            all_logits.append(logits)
+            all_labels.append(labels)
+
+    if len(all_logits) == 0:
+        print("No valid test samples found!")
+        return
+
+    # Concatenate all results
+    all_logits = torch.cat(all_logits, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+
+    # Calculate metrics
+    avg_loss = total_loss / len(test_loader)
+    top1_acc = evaluator.calculate_accuracy(all_logits, all_labels)
+    top5_acc = evaluator.calculate_top_k_accuracy(all_logits, all_labels, k=5)
+
+    writer.add_scalar('Loss/Test/Classification', avg_loss, epoch)
+    writer.add_scalar('Acc/Test/Classification_Top1', top1_acc, epoch)
+    writer.add_scalar('Acc/Test/Classification_Top5', top5_acc, epoch)
+
+    # Log to wandb
+    if not args.no_wandb:
+        wandb.log({
+            'test/classification_loss': avg_loss,
+            'test/classification_top1_accuracy': top1_acc,
+            'test/classification_top5_accuracy': top5_acc,
+        })
+
+    print(f'E: {epoch} | Test Loss: {avg_loss:.4f} | Top-1 Acc: {top1_acc:.4f} | Top-5 Acc: {top5_acc:.4f}')
 
 def calculate_p1_action(dset, scores, action_gt):
     pair_pred = np.argmax(scores.numpy(), axis=1)

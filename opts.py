@@ -56,3 +56,11 @@ parser.add_argument('--wandb_config', type=str, default=None, help='Path to wand
 parser.add_argument('--wandb-run-name', type=str, default='euclidean')
 parser.add_argument('--no-wandb', action='store_true', default=False, help='Disable wandb logging')
 parser.add_argument('--glove-path', type=str, default='glove.6B.300d.txt', help='Path to GloVe embeddings file')
+
+# Classification mode arguments
+parser.add_argument('--classification-mode', action='store_true', default=False, help='Use classification instead of metric learning')
+parser.add_argument('--class-mode', type=str, choices=['present_only', 'all_classes'], default='present_only',
+                    help='Classification class mode: present_only (only training pairs) or all_classes (all combinations + antonyms)')
+parser.add_argument('--manifold', type=str, default='euclidean', choices=['euclidean', 'hyperbolic'],
+                    help='Manifold type for embeddings (for compatibility, not used in classification)')
+parser.add_argument('--num-layers', type=int, default=2, help='Number of layers in the classifier')

@@ -204,6 +204,125 @@ class ActionModifiers(nn.Module):
                 loss, pred, att, vid_feats = self.val_forward(x)
         return loss, pred, att, vid_feats
 
+class StackedAttention(nn.Module):
+    def __init__(self, d_model, d_k, d_v, emb_dim, heads=1, num_layers=3, dropout=0.0):
+        super(StackedAttention, self).__init__()
+        
+        self.layers = nn.ModuleList([
+            SDPAttention(d_model, d_k, d_v, emb_dim, heads, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(emb_dim) for _ in range(num_layers)
+        ])
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, features, queries, mask=None):
+        output = queries
+        attention_scores = []
+        
+        for attn_layer, norm in zip(self.layers, self.layer_norms):
+            # Apply attention
+            attn_out, scores = attn_layer(features, output, mask)
+            attention_scores.append(scores)
+            
+            # Residual connection + dropout + layer norm
+            output = norm(output + self.dropout(attn_out))
+        
+        return output, attention_scores
+
+
+class ActionAdverbClassifier(nn.Module):
+    def __init__(self, dset, args):
+        super(ActionAdverbClassifier, self).__init__()
+        self.num_heads = 4
+        self.dset = dset
+        self.num_layers = args.num_layers
+        # Feature encoder
+        if args.temporal_agg == 'sdp':
+            if self.num_layers > 1:
+                self.feature_encoder = StackedAttention(dset.feature_dim, args.emb_dim, args.emb_dim,
+                                              args.emb_dim, heads=self.num_heads, num_layers=self.num_layers)
+            else:
+                self.feature_encoder = SDPAttention(dset.feature_dim, args.emb_dim, args.emb_dim,
+                                              args.emb_dim, heads=self.num_heads)
+            self.transformer = True
+        else:
+            self.feature_encoder = MLP(dset.feature_dim, args.emb_dim, num_layers=args.num_layers)
+            self.transformer = False
+
+        # Classification head
+        self.classifier = nn.Linear(args.emb_dim, dset.num_classes)
+
+        # For attention in SDP mode
+        if hasattr(dset, 'action_embedder'):
+            self.action_embedder = dset.action_embedder
+        else:
+            # Dummy action embedder for attention mechanism
+            self.action_embedder = nn.Embedding(len(dset.actions), args.emb_dim)
+            if args.glove_init:
+                pretrained_weight = load_word_embeddings(args.glove_path, dset.actions)
+                self.action_embedder.weight.data.copy_(pretrained_weight)
+
+    def forward(self, x):
+        features = x[0]
+        batch_size = features.shape[0]
+
+        if self.transformer:
+            pad = x[2]
+            temporal_dim = features.shape[1]
+            mask = torch.arange(temporal_dim).expand(len(pad), temporal_dim).cuda() < temporal_dim - pad.unsqueeze(1)
+
+            # Use a dummy action embedding for attention (all zeros)
+            dummy_action = torch.zeros(batch_size, dtype=torch.long).cuda()
+            action_embedding = self.action_embedder(dummy_action)
+
+            video_embedding, attention_weights = self.feature_encoder(features, action_embedding, mask=mask)
+        else:
+            video_embedding = self.feature_encoder(features)
+            attention_weights = None
+
+        # Classification
+        logits = self.classifier(video_embedding)
+
+        return logits, attention_weights
+
+class ClassificationEvaluator:
+    def __init__(self, dset):
+        self.dset = dset
+        self.num_classes = dset.num_classes
+
+    def calculate_accuracy(self, logits, labels):
+        """Calculate top-1 accuracy."""
+        predictions = torch.argmax(logits, dim=1)
+        correct = (predictions == labels).float()
+        accuracy = correct.mean()
+        return accuracy
+
+    def calculate_top_k_accuracy(self, logits, labels, k=5):
+        """Calculate top-k accuracy."""
+        _, top_k_pred = torch.topk(logits, k, dim=1)
+        labels_expanded = labels.unsqueeze(1).expand_as(top_k_pred)
+        correct = (top_k_pred == labels_expanded).any(dim=1).float()
+        accuracy = correct.mean()
+        return accuracy
+
+    def get_per_class_accuracy(self, logits, labels):
+        """Calculate per-class accuracy."""
+        predictions = torch.argmax(logits, dim=1)
+        per_class_acc = {}
+
+        for class_idx in range(self.num_classes):
+            class_mask = (labels == class_idx)
+            if class_mask.sum() > 0:
+                class_correct = (predictions[class_mask] == class_idx).float().mean()
+                pair = self.dset.idx2class[class_idx]
+                per_class_acc[pair] = class_correct.item()
+
+        return per_class_acc
+
 class Evaluator:
     def __init__(self, dset, model):
         self.dset = dset
