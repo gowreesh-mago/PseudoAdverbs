@@ -3,3 +3,4 @@
 __pycache__/
 checkpoints/
 wandb_config.json
+VATEX_Adverbs_features/

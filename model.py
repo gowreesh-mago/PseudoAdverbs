@@ -248,3 +248,13 @@ class Evaluator:
         return scores, action_gt_scores, antonym_action_gt_scores
 
     
+class HyperbolicModel(nn.Module):
+    def __init__(self):
+        super(HyperbolicModel, self).__init__()
+        pass
+    def encode_visual(self,):
+        pass
+    def encode_textual(self,):
+        pass
+    def forward(self,):
+        pass
