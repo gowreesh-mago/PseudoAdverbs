@@ -8,20 +8,46 @@ from decord import VideoReader, cpu
 import logging
 import argparse
 import re
+import json
+import csv
+import random
+from torch.utils.data import Dataset
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+def load_antonym_mapping(json_path):
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+
+    antonym_map = {}
+    for pair in data['adverb_antonym_pairs']:
+        adverb = pair['adverb']
+        antonym_map[adverb] = pair['replacements']
+    return antonym_map
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', type=str, default='OpenGVLab/InternVideo2_Stage2_6B_224p')
     parser.add_argument('--video_dir', type=str, default='datasets/VATEX_Adverbs/videos')
     parser.add_argument('--annotations', type=str, default='datasets/VATEX_Adverbs/annotations.csv')
-    parser.add_argument('--adverbs_file', type=str, default='datasets/VATEX_Adverbs/adverbs.csv')
+    parser.add_argument('--adverbs_file', type=str, default='datasets/VATEX_Adverbs/adverbs.csv',
+                        help='CSV file with adverb-antonym pairs (used if --hierarchy is not provided)')
+    parser.add_argument('--hierarchy', type=str, default=None,
+                        help='JSON file with adverb hierarchy and replacements (alternative to --adverbs_file)')
+    parser.add_argument('--k', type=int, default=10,
+                        help='Number of negative captions to generate per sample (when using --hierarchy)')
     parser.add_argument('--num_frames', type=int, default=8)
-    parser.add_argument('--max_samples', type=int, default=None)
+    parser.add_argument('--max_samples', type=int, default=None,
+                        help='Maximum number of samples to evaluate (None = all samples)')
+    parser.add_argument('--random_sample', action='store_true',
+                        help='Randomly sample max_samples instead of taking first N')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for sampling')
     parser.add_argument('--num_examples', type=int, default=5)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Directory to save per-adverb metrics CSV (if not provided, results are only logged)')
     return parser.parse_args()
 
 def load_adverb_data(adverbs_file):
@@ -30,25 +56,159 @@ def load_adverb_data(adverbs_file):
     all_adverbs = list(set(df['adverb'].tolist() + df['antonym'].tolist()))
     return antonym_map, all_adverbs
 
-def replace_adverb_in_caption(caption, adverb, replacement):
-    pattern = r'\b' + re.escape(adverb) + r'\b'
-    return re.sub(pattern, replacement, caption, flags=re.IGNORECASE)
+def replace_adverb_in_caption(caption, adverb, replacements, k=1):
+    """
+    Replace adverb in caption with one or more replacements, preserving case.
 
-def generate_negative_captions(caption, original_adverb, all_adverbs):
+    Args:
+        caption: Original caption text
+        adverb: Adverb to replace
+        replacements: Single replacement string or list of replacement strings
+        k: Number of replacements to select (if replacements is a list)
+
+    Returns:
+        List of modified captions (or single caption if replacements is a string)
+    """
+    # Handle single replacement string
+    if isinstance(replacements, str):
+        replacements = [replacements]
+        return_single = True
+    else:
+        return_single = False
+
+    pattern = re.compile(r'\b' + re.escape(adverb) + r'\b', re.IGNORECASE)
+    selected = random.sample(replacements, min(k, len(replacements)))
+
+    results = []
+    for replacement in selected:
+        def match_case(match, repl=replacement):
+            word = match.group()
+            if word.isupper():
+                return repl.upper()
+            elif word[0].isupper():
+                return repl.capitalize()
+            return repl
+        results.append(pattern.sub(match_case, caption))
+
+    return results[0] if return_single else results
+
+def generate_negative_captions(caption, original_adverb, all_adverbs=None, antonym_map=None, k=None):
+    """
+    Generate negative captions by replacing the adverb.
+
+    Args:
+        caption: Original caption text
+        original_adverb: The adverb to replace
+        all_adverbs: List of all possible adverbs (for exhaustive replacement)
+        antonym_map: Dictionary mapping adverbs to their replacements (from hierarchy)
+        k: Number of negative captions to generate (when using antonym_map)
+
+    Returns:
+        Tuple of (negative_captions, negative_adverbs)
+    """
     negatives = []
     negative_adverbs = []
-    for adv in all_adverbs:
-        if adv != original_adverb:
-            neg_caption = replace_adverb_in_caption(caption, original_adverb, adv)
-            if neg_caption != caption:
-                negatives.append(neg_caption)
-                negative_adverbs.append(adv)
+
+    # Use hierarchy-based approach if antonym_map is provided
+    if antonym_map is not None and original_adverb in antonym_map:
+        replacements = antonym_map[original_adverb]
+        if k is not None:
+            # Generate k negative captions
+            negative_captions = replace_adverb_in_caption(caption, original_adverb, replacements, k)
+            if not isinstance(negative_captions, list):
+                negative_captions = [negative_captions]
+            for neg_cap in negative_captions:
+                if neg_cap != caption:
+                    negatives.append(neg_cap)
+                    # Extract which replacement was used (approximate)
+                    for repl in replacements:
+                        if repl.lower() in neg_cap.lower() and repl.lower() != original_adverb.lower():
+                            negative_adverbs.append(repl)
+                            break
+                    else:
+                        negative_adverbs.append(replacements[0])  # fallback
+        else:
+            # Generate negative caption for each replacement
+            for repl in replacements:
+                neg_caption = replace_adverb_in_caption(caption, original_adverb, repl)
+                if neg_caption != caption:
+                    negatives.append(neg_caption)
+                    negative_adverbs.append(repl)
+    # Use all-adverbs approach if provided
+    elif all_adverbs is not None:
+        for adv in all_adverbs:
+            if adv != original_adverb:
+                neg_caption = replace_adverb_in_caption(caption, original_adverb, adv)
+                if neg_caption != caption:
+                    negatives.append(neg_caption)
+                    negative_adverbs.append(adv)
+
     return negatives, negative_adverbs
 
-def load_video(video_path, num_frames=8):
+class NegativeCaptionDataset(Dataset):
+    """Dataset for loading video annotations with negative captions based on adverb replacements."""
+
+    def __init__(self, annotations_path, hierarchy_path, k=1):
+        self.antonym_map = load_antonym_mapping(hierarchy_path)
+        self.k = k
+
+        with open(annotations_path, 'r') as f:
+            reader = csv.DictReader(f)
+            self.data = list(reader)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data[idx]
+        adverb = row['adverb'].lower()
+        clustered_adverb = row['clustered_adverb'].lower()
+        caption = row['caption']
+
+        if clustered_adverb in self.antonym_map:
+            negative_captions = replace_adverb_in_caption(caption, adverb, self.antonym_map[clustered_adverb], self.k)
+        else:
+            negative_captions = [caption] * self.k
+
+        return {
+            'clip_id': row['clip_id'],
+            'caption': caption,
+            'negative_captions': negative_captions,
+            'action': row['action'],
+            'adverb': adverb,
+            'clustered_adverb': clustered_adverb
+        }
+
+def load_video(video_path, num_frames=8, start_time=None, end_time=None):
+    """
+    Load video frames from a video file.
+
+    Args:
+        video_path: Path to video file
+        num_frames: Number of frames to sample
+        start_time: Start time in seconds (if None, starts from beginning)
+        end_time: End time in seconds (if None, goes to end)
+
+    Returns:
+        Tensor of shape (num_frames, C, H, W) with normalized frames
+    """
     vr = VideoReader(video_path, ctx=cpu(0))
+    fps = vr.get_avg_fps()
     total_frames = len(vr)
-    indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+
+    # Calculate frame indices based on time range
+    if start_time is not None and end_time is not None:
+        start_frame = int(start_time * fps)
+        end_frame = int(end_time * fps)
+        # Ensure frames are within valid range
+        start_frame = max(0, min(start_frame, total_frames - 1))
+        end_frame = max(start_frame + 1, min(end_frame, total_frames))
+    else:
+        start_frame = 0
+        end_frame = total_frames
+
+    # Sample frames uniformly from the specified range
+    indices = np.linspace(start_frame, end_frame - 1, num_frames, dtype=int)
     frames = vr.get_batch(indices).asnumpy()
     frames = torch.from_numpy(frames).permute(0, 3, 1, 2).float()
     frames = frames / 255.0
@@ -150,23 +310,49 @@ def log_adverb_negative_examples(examples, num_examples=5):
                     logger.info(f"    {i+1}. [NEG:{ex['negative_adverbs'][neg_idx]}] \"{ex['negative_texts'][neg_idx]}\" (score={score:.4f})")
 
 def compute_per_adverb_metrics(examples):
+    """
+    Compute comprehensive per-adverb metrics.
+
+    Returns:
+        Dictionary mapping adverb -> metrics dict with R@1, R@3, R@5, MRR, ranks, etc.
+    """
     adverb_results = {}
     for ex in examples:
         adv = ex['adverb']
         if adv not in adverb_results:
-            adverb_results[adv] = {'correct': 0, 'total': 0, 'ranks': [], 'num_candidates': []}
+            adverb_results[adv] = {
+                'r1_correct': 0,
+                'r3_correct': 0,
+                'r5_correct': 0,
+                'total': 0,
+                'ranks': [],
+                'reciprocal_ranks': [],
+                'num_candidates': []
+            }
+
         adverb_results[adv]['total'] += 1
         adverb_results[adv]['ranks'].append(ex['gt_rank'])
+        adverb_results[adv]['reciprocal_ranks'].append(1.0 / ex['gt_rank'])
         adverb_results[adv]['num_candidates'].append(ex['num_negatives'] + 1)
+
+        # Track R@k metrics
         if ex['gt_rank'] == 1:
-            adverb_results[adv]['correct'] += 1
+            adverb_results[adv]['r1_correct'] += 1
+        if ex['gt_rank'] <= 3:
+            adverb_results[adv]['r3_correct'] += 1
+        if ex['gt_rank'] <= 5:
+            adverb_results[adv]['r5_correct'] += 1
 
     per_adverb = {}
     for adv, data in adverb_results.items():
         per_adverb[adv] = {
-            'R@1': data['correct'] / data['total'] * 100,
+            'R@1': data['r1_correct'] / data['total'] * 100,
+            'R@3': data['r3_correct'] / data['total'] * 100,
+            'R@5': data['r5_correct'] / data['total'] * 100,
+            'MRR': np.mean(data['reciprocal_ranks']) * 100,
             'count': data['total'],
             'mean_rank': np.mean(data['ranks']),
+            'median_rank': np.median(data['ranks']),
             'mean_candidates': np.mean(data['num_candidates'])
         }
     return per_adverb
@@ -188,17 +374,43 @@ def main():
         trust_remote_code=True
     )
 
-    logger.info(f"Loading adverb data from {args.adverbs_file}")
-    antonym_map, all_adverbs = load_adverb_data(args.adverbs_file)
-    logger.info(f"Loaded {len(antonym_map)} antonym pairs, {len(all_adverbs)} unique adverbs")
+    # Load adverb data - either from hierarchy JSON or CSV
+    if args.hierarchy:
+        logger.info(f"Loading adverb hierarchy from {args.hierarchy}")
+        hierarchy_antonym_map = load_antonym_mapping(args.hierarchy)
+        logger.info(f"Loaded {len(hierarchy_antonym_map)} adverbs from hierarchy")
+        all_adverbs = None
+        csv_antonym_map = None
+    else:
+        logger.info(f"Loading adverb data from {args.adverbs_file}")
+        csv_antonym_map, all_adverbs = load_adverb_data(args.adverbs_file)
+        logger.info(f"Loaded {len(csv_antonym_map)} antonym pairs, {len(all_adverbs)} unique adverbs")
+        hierarchy_antonym_map = None
 
     logger.info(f"Loading annotations from {args.annotations}")
     df = pd.read_csv(args.annotations)
 
+    # Sample subset if requested
     if args.max_samples:
-        df = df.head(args.max_samples)
+        if args.random_sample:
+            np.random.seed(args.seed)
+            sample_indices = np.random.choice(len(df), min(args.max_samples, len(df)), replace=False)
+            df = df.iloc[sample_indices].reset_index(drop=True)
+            logger.info(f"Randomly sampled {len(df)} samples (seed={args.seed})")
+        else:
+            df = df.head(args.max_samples)
+            logger.info(f"Using first {len(df)} samples")
+    else:
+        logger.info(f"Using all samples")
 
-    logger.info(f"Total samples: {len(df)}")
+    logger.info(f"Total samples to evaluate: {len(df)}")
+
+    # Check if time-based sampling is available
+    has_time_info = 'start_time' in df.columns and 'end_time' in df.columns
+    if has_time_info:
+        logger.info("Using time-based frame sampling (start_time, end_time from annotations)")
+    else:
+        logger.info("Using full-video frame sampling (no time info available)")
 
     video_embeddings = []
     text_embeddings = []
@@ -216,8 +428,12 @@ def main():
 
         adverb = row.get('adverb', row.get('clustered_adverb', None))
 
+        # Get start and end times if available
+        start_time = row.get('start_time', None)
+        end_time = row.get('end_time', None)
+
         try:
-            video = load_video(video_path, args.num_frames)
+            video = load_video(video_path, args.num_frames, start_time=start_time, end_time=end_time)
             video = video.unsqueeze(0).to(args.device, dtype=torch.float16)
 
             text = row['caption'] if 'caption' in row else f"{row['action']} {row['adverb']}"
@@ -234,8 +450,23 @@ def main():
             valid_texts.append(text)
             valid_indices.append(idx)
 
-            if adverb is not None and adverb in all_adverbs:
-                negative_texts, negative_adverbs = generate_negative_captions(text, adverb, all_adverbs)
+            # Generate negative captions based on available data
+            should_generate = (
+                (hierarchy_antonym_map is not None and adverb in hierarchy_antonym_map) or
+                (all_adverbs is not None and adverb in all_adverbs)
+            )
+
+            if adverb is not None and should_generate:
+                if hierarchy_antonym_map is not None:
+                    # Use hierarchy-based approach with k replacements
+                    negative_texts, negative_adverbs = generate_negative_captions(
+                        text, adverb, antonym_map=hierarchy_antonym_map, k=args.k
+                    )
+                else:
+                    # Use all-adverbs approach
+                    negative_texts, negative_adverbs = generate_negative_captions(
+                        text, adverb, all_adverbs=all_adverbs
+                    )
 
                 if len(negative_texts) > 0:
                     neg_inputs = tokenizer(negative_texts, return_tensors='pt', padding=True, truncation=True)
@@ -327,8 +558,25 @@ def main():
         per_adverb = compute_per_adverb_metrics(adverb_negative_examples)
         sorted_adverbs = sorted(per_adverb.items(), key=lambda x: x[1]['R@1'], reverse=True)
 
+        logger.info(f"{'Adverb':<20} | {'R@1':>7} | {'R@3':>7} | {'R@5':>7} | {'MRR':>7} | {'Count':>6} | {'Mean Rank':>10} | {'Median Rank':>12} | {'Avg Cands':>10}")
+        logger.info("-" * 120)
         for adv, metrics in sorted_adverbs:
-            logger.info(f"  {adv:20s} | R@1: {metrics['R@1']:6.2f}% | Count: {metrics['count']:4d} | Mean Rank: {metrics['mean_rank']:.2f} | Avg Candidates: {metrics['mean_candidates']:.1f}")
+            logger.info(f"{adv:<20} | {metrics['R@1']:6.2f}% | {metrics['R@3']:6.2f}% | {metrics['R@5']:6.2f}% | {metrics['MRR']:6.2f}% | {metrics['count']:6d} | {metrics['mean_rank']:10.2f} | {metrics['median_rank']:12.1f} | {metrics['mean_candidates']:10.1f}")
+
+        # Save per-adverb metrics to CSV if output_dir is specified
+        if args.output_dir:
+            os.makedirs(args.output_dir, exist_ok=True)
+            csv_path = os.path.join(args.output_dir, 'per_adverb_metrics.csv')
+
+            with open(csv_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=['adverb', 'R@1', 'R@3', 'R@5', 'MRR', 'count', 'mean_rank', 'median_rank', 'mean_candidates'])
+                writer.writeheader()
+                for adv, metrics in sorted_adverbs:
+                    row = {'adverb': adv}
+                    row.update(metrics)
+                    writer.writerow(row)
+
+            logger.info(f"\nPer-adverb metrics saved to: {csv_path}")
 
     logger.info("\n" + "="*60)
     logger.info("OVERALL PERFORMANCE SUMMARY")
