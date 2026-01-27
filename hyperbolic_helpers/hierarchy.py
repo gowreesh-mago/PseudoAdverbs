@@ -51,6 +51,22 @@ class Hierarchy:
     def get_all_parent_adverbs(self) -> List[str]:
         return list(self.parent_to_adverbs.keys())
 
+    def get_all_actions(self) -> List[str]:
+        """Get all child actions (primitives with parents)."""
+        return list(self.action_to_parent.keys())
+
+    def get_all_adverbs(self) -> List[str]:
+        """Get all child adverbs (primitives with parents)."""
+        return list(self.adverb_to_parent.keys())
+
+    def get_all_actions_with_parents(self) -> Dict[str, str]:
+        """Get all actions mapped to their parent categories."""
+        return dict(self.action_to_parent)
+
+    def get_all_adverbs_with_parents(self) -> Dict[str, str]:
+        """Get all adverbs mapped to their parent categories."""
+        return dict(self.adverb_to_parent)
+
     def get_semantic_hierarchy_pairs(
         self,
         action_list: List[str],

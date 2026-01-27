@@ -26,7 +26,7 @@
       "lunge",
       "pedal"
     ],
-    "body_posture": [
+    "posture": [
       "stand",
       "sit",
       "squat",
@@ -106,7 +106,7 @@
       "point",
       "clap"
     ],
-    "physical_contact": [
+    "contact": [
       "hit",
       "stab",
       "fight",
@@ -119,7 +119,7 @@
       "touch"
     ],
     "consumption": ["eat", "drink", "smoke", "feed"],
-    "state_change": [
+    "transformation": [
       "cook",
       "burn",
       "cool",
@@ -133,7 +133,7 @@
     "respiration": ["breathe", "sneeze"],
     "recreation": ["play", "dance"],
     "creation": ["make", "draw", "mark"],
-    "tool_operation": ["use", "click", "drill", "strum", "drive", "park"]
+    "operation": ["use", "click", "drill", "strum", "drive", "park"]
   },
   "adverb_hierarchy": {
     "speed": ["quickly", "slowly", "instantly", "gradually"],
@@ -160,8 +160,8 @@
     ],
     "force": ["gently", "firmly"],
     "completeness": ["partially", "completely"],
-    "activation_state": ["on", "off"],
-    "temporal_pattern": ["continuously", "periodically"],
+    "activation": ["on", "off"],
+    "temporality": ["continuously", "periodically"],
     "intentionality": ["accidently", "purposefully"],
     "volume": ["quietly", "loudly"]
   },

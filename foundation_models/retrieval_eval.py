@@ -3,8 +3,9 @@ import torch
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
-from decord import VideoReader, cpu
+from transformers import XCLIPProcessor, XCLIPModel
+import cv2
+from PIL import Image
 import logging
 import argparse
 import re
@@ -22,13 +23,13 @@ def load_antonym_mapping(json_path):
 
     antonym_map = {}
     for pair in data['adverb_antonym_pairs']:
-        adverb = pair['adverb']
+        adverb = pair['adverb'].lower()  # Normalize to lowercase
         antonym_map[adverb] = pair['replacements']
     return antonym_map
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name', type=str, default='OpenGVLab/InternVideo2_Stage2_6B_224p')
+    parser.add_argument('--model_name', type=str, default='microsoft/xclip-base-patch32')
     parser.add_argument('--video_dir', type=str, default='datasets/VATEX_Adverbs/videos')
     parser.add_argument('--annotations', type=str, default='datasets/VATEX_Adverbs/annotations.csv')
     parser.add_argument('--adverbs_file', type=str, default='datasets/VATEX_Adverbs/adverbs.csv',
@@ -48,6 +49,10 @@ def parse_args():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--output_dir', type=str, default=None,
                         help='Directory to save per-adverb metrics CSV (if not provided, results are only logged)')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug logging for detailed execution trace')
+    parser.add_argument('--use_time_limits', action='store_true',
+                        help='Sample frames between start_time and end_time from CSV (default: sample uniformly across entire video)')
     return parser.parse_args()
 
 def load_adverb_data(adverbs_file):
@@ -92,16 +97,17 @@ def replace_adverb_in_caption(caption, adverb, replacements, k=1):
 
     return results[0] if return_single else results
 
-def generate_negative_captions(caption, original_adverb, all_adverbs=None, antonym_map=None, k=None):
+def generate_negative_captions(caption, original_adverb, all_adverbs=None, antonym_map=None, k=None, clustered_adverb=None):
     """
     Generate negative captions by replacing the adverb.
 
     Args:
         caption: Original caption text
-        original_adverb: The adverb to replace
+        original_adverb: The adverb to replace in the caption text
         all_adverbs: List of all possible adverbs (for exhaustive replacement)
         antonym_map: Dictionary mapping adverbs to their replacements (from hierarchy)
         k: Number of negative captions to generate (when using antonym_map)
+        clustered_adverb: The clustered/canonical adverb form for hierarchy lookup
 
     Returns:
         Tuple of (negative_captions, negative_adverbs)
@@ -110,8 +116,10 @@ def generate_negative_captions(caption, original_adverb, all_adverbs=None, anton
     negative_adverbs = []
 
     # Use hierarchy-based approach if antonym_map is provided
-    if antonym_map is not None and original_adverb in antonym_map:
-        replacements = antonym_map[original_adverb]
+    # Use clustered_adverb for lookup, but original_adverb for text replacement
+    lookup_adverb = clustered_adverb if clustered_adverb is not None else original_adverb
+    if antonym_map is not None and lookup_adverb in antonym_map:
+        replacements = antonym_map[lookup_adverb]
         if k is not None:
             # Generate k negative captions
             negative_captions = replace_adverb_in_caption(caption, original_adverb, replacements, k)
@@ -181,7 +189,7 @@ class NegativeCaptionDataset(Dataset):
 
 def load_video(video_path, num_frames=8, start_time=None, end_time=None):
     """
-    Load video frames from a video file.
+    Load video frames from a video file using cv2 for X-CLIP.
 
     Args:
         video_path: Path to video file
@@ -190,28 +198,64 @@ def load_video(video_path, num_frames=8, start_time=None, end_time=None):
         end_time: End time in seconds (if None, goes to end)
 
     Returns:
-        Tensor of shape (num_frames, C, H, W) with normalized frames
+        List of PIL Images
     """
-    vr = VideoReader(video_path, ctx=cpu(0))
-    fps = vr.get_avg_fps()
-    total_frames = len(vr)
+    video = cv2.VideoCapture(video_path)
+    fps = video.get(cv2.CAP_PROP_FPS)
+    total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps
 
-    # Calculate frame indices based on time range
+    logger.debug(f"Loading video: {os.path.basename(video_path)}")
+    logger.debug(f"  FPS: {fps:.2f}, Total frames: {total_frames}, Duration: {duration:.2f}s")
+
     if start_time is not None and end_time is not None:
-        start_frame = int(start_time * fps)
-        end_frame = int(end_time * fps)
-        # Ensure frames are within valid range
-        start_frame = max(0, min(start_frame, total_frames - 1))
-        end_frame = max(start_frame + 1, min(end_frame, total_frames))
+        # Validate time range is within video duration
+        if start_time >= duration or end_time > duration + 1.0:
+            logger.warning(f"  Requested time range ({start_time:.2f}s-{end_time:.2f}s) exceeds video duration ({duration:.2f}s)")
+            logger.warning(f"  Falling back to sampling entire video")
+            start_frame = 0
+            end_frame = total_frames
+        else:
+            # Clamp to valid range within the video
+            start_time_clamped = max(0, min(start_time, duration))
+            end_time_clamped = max(start_time_clamped + 0.1, min(end_time, duration))
+
+            start_frame = int(start_time_clamped * fps)
+            end_frame = int(end_time_clamped * fps)
+            start_frame = max(0, min(start_frame, total_frames - 1))
+            end_frame = max(start_frame + 1, min(end_frame, total_frames))
+            logger.debug(f"  Time range: {start_time:.2f}s to {end_time:.2f}s (frames {start_frame}-{end_frame})")
     else:
         start_frame = 0
         end_frame = total_frames
+        logger.debug(f"  Sampling entire video (0-{duration:.2f}s)")
 
-    # Sample frames uniformly from the specified range
-    indices = np.linspace(start_frame, end_frame - 1, num_frames, dtype=int)
-    frames = vr.get_batch(indices).asnumpy()
-    frames = torch.from_numpy(frames).permute(0, 3, 1, 2).float()
-    frames = frames / 255.0
+    # Calculate which frames to extract
+    frame_indices = np.linspace(start_frame, end_frame - 1, num_frames, dtype=int)
+    logger.debug(f"  Sampling {num_frames} frames at indices: {frame_indices.tolist()}")
+
+    frames = []
+    for idx in frame_indices:
+        video.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        success, frame = video.read()
+        if success:
+            # Convert BGR to RGB and then to PIL Image
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(frame_rgb)
+            frames.append(pil_image)
+            logger.debug(f"    Frame {idx}: {frame_rgb.shape} -> PIL Image {pil_image.size}")
+
+    video.release()
+
+    # Ensure we have the right number of frames
+    if len(frames) < num_frames and len(frames) > 0:
+        # Duplicate last frame if needed
+        original_count = len(frames)
+        while len(frames) < num_frames:
+            frames.append(frames[-1])
+        logger.debug(f"  Padded from {original_count} to {len(frames)} frames")
+
+    logger.debug(f"  Successfully loaded {len(frames)} frames")
     return frames
 
 def compute_similarity(video_embeds, text_embeds):
@@ -237,8 +281,9 @@ def compute_adverb_negative_recall(video_embed, original_embed, negative_embeds,
     original_embed = original_embed / original_embed.norm(dim=-1, keepdim=True)
     negative_embeds = negative_embeds / negative_embeds.norm(dim=-1, keepdim=True)
 
-    all_embeds = torch.cat([original_embed.unsqueeze(0), negative_embeds], dim=0)
-    scores = (video_embed @ all_embeds.T).squeeze(0)
+    # Concatenate: original_embed is [1, 512], negative_embeds is [k, 512] -> [k+1, 512]
+    all_embeds = torch.cat([original_embed, negative_embeds], dim=0)
+    scores = (video_embed @ all_embeds.T).squeeze()
 
     rankings = scores.argsort(descending=True)
     gt_rank = (rankings == 0).nonzero(as_tuple=True)[0].item() + 1
@@ -360,25 +405,41 @@ def compute_per_adverb_metrics(examples):
 def main():
     args = parse_args()
 
+    # Enable debug logging if requested
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        logger.info("Debug logging ENABLED")
+
+    logger.info(f"{'='*60}")
+    logger.info(f"EVALUATION CONFIGURATION")
+    logger.info(f"{'='*60}")
+    logger.info(f"Model: {args.model_name}")
+    logger.info(f"Device: {args.device}")
+    logger.info(f"Video dir: {args.video_dir}")
+    logger.info(f"Annotations: {args.annotations}")
+    logger.info(f"Num frames: {args.num_frames}")
+    logger.info(f"Use time limits: {args.use_time_limits}")
+    logger.info(f"Max samples: {args.max_samples}")
+    logger.info(f"Random sample: {args.random_sample}")
+    logger.info(f"Seed: {args.seed}")
+    logger.info(f"K (negatives): {args.k}")
+    logger.info(f"Output dir: {args.output_dir}")
+    logger.debug(f"Debug logging: ENABLED")
+    logger.info(f"{'='*60}\n")
+
     logger.info(f"Loading model: {args.model_name}")
-    model = AutoModel.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.float16,
-        trust_remote_code=True
-    )
+    processor = XCLIPProcessor.from_pretrained(args.model_name)
+    model = XCLIPModel.from_pretrained(args.model_name)
     model = model.to(args.device)
     model.eval()
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name,
-        trust_remote_code=True
-    )
+    logger.info(f"Model loaded successfully\n")
 
     # Load adverb data - either from hierarchy JSON or CSV
     if args.hierarchy:
         logger.info(f"Loading adverb hierarchy from {args.hierarchy}")
         hierarchy_antonym_map = load_antonym_mapping(args.hierarchy)
         logger.info(f"Loaded {len(hierarchy_antonym_map)} adverbs from hierarchy")
+        logger.debug(f"Hierarchy keys: {list(hierarchy_antonym_map.keys())}")
         all_adverbs = None
         csv_antonym_map = None
     else:
@@ -389,6 +450,8 @@ def main():
 
     logger.info(f"Loading annotations from {args.annotations}")
     df = pd.read_csv(args.annotations)
+    logger.debug(f"Loaded {len(df)} annotations")
+    logger.debug(f"Columns: {df.columns.tolist()}")
 
     # Sample subset if requested
     if args.max_samples:
@@ -423,65 +486,124 @@ def main():
     for idx, row in tqdm(df.iterrows(), total=len(df)):
         video_path = os.path.join(args.video_dir, f"{row['clip_id']}.mp4")
 
+        logger.debug(f"\n{'='*60}")
+        logger.debug(f"Processing sample {idx}/{len(df)}: {row['clip_id']}")
+
         if not os.path.exists(video_path):
+            logger.warning(f"Video not found: {video_path}")
             continue
 
         adverb = row.get('adverb', row.get('clustered_adverb', None))
+        clustered_adverb = row.get('clustered_adverb', adverb)
 
-        # Get start and end times if available
-        start_time = row.get('start_time', None)
-        end_time = row.get('end_time', None)
+        # Normalize to lowercase for hierarchy lookup
+        if clustered_adverb:
+            clustered_adverb_lower = clustered_adverb.lower()
+        else:
+            clustered_adverb_lower = None
+
+        logger.debug(f"Adverb info: adverb='{adverb}', clustered='{clustered_adverb}', lower='{clustered_adverb_lower}'")
 
         try:
-            video = load_video(video_path, args.num_frames, start_time=start_time, end_time=end_time)
-            video = video.unsqueeze(0).to(args.device, dtype=torch.float16)
+            # Use time-based sampling if flag is enabled and times are available
+            if args.use_time_limits and 'start_time' in row and 'end_time' in row:
+                start_time = float(row['start_time']) if row['start_time'] else None
+                end_time = float(row['end_time']) if row['end_time'] else None
+                video_frames = load_video(video_path, args.num_frames, start_time, end_time)
+            else:
+                # Sample uniformly across entire video (default)
+                video_frames = load_video(video_path, args.num_frames)
+            logger.debug(f"Loaded {len(video_frames)} video frames")
 
             text = row['caption'] if 'caption' in row else f"{row['action']} {row['adverb']}"
-
-            text_inputs = tokenizer(text, return_tensors='pt', padding=True, truncation=True)
-            text_inputs = {k: v.to(args.device) for k, v in text_inputs.items()}
+            logger.debug(f"Caption: \"{text}\"")
 
             with torch.no_grad():
-                video_embed = model.encode_video(video)
-                text_embed = model.encode_text(text_inputs)
+                # X-CLIP API: use processor and model
+                # Pass video frames as a list wrapped in another list (batch of videos)
+                logger.debug(f"Processing video with X-CLIP processor...")
+                inputs = processor(videos=[video_frames], return_tensors="pt", padding=True)
+                logger.debug(f"  Video input shapes: {[(k, v.shape) for k, v in inputs.items()]}")
+                inputs = {k: v.to(args.device) for k, v in inputs.items()}
+                video_outputs = model.get_video_features(**inputs)
+                logger.debug(f"  Video features shape: {video_outputs.shape}")
+                video_embed = video_outputs / video_outputs.norm(dim=-1, keepdim=True)
+                logger.debug(f"  Normalized video embed shape: {video_embed.shape}")
+
+                logger.debug(f"Processing text with X-CLIP processor...")
+                text_inputs = processor(text=[text], return_tensors="pt", padding=True)
+                logger.debug(f"  Text input shapes: {[(k, v.shape) for k, v in text_inputs.items()]}")
+                text_inputs = {k: v.to(args.device) for k, v in text_inputs.items()}
+                text_outputs = model.get_text_features(**text_inputs)
+                logger.debug(f"  Text features shape: {text_outputs.shape}")
+                text_embed = text_outputs / text_outputs.norm(dim=-1, keepdim=True)
+                logger.debug(f"  Normalized text embed shape: {text_embed.shape}")
 
             video_embeddings.append(video_embed.cpu())
             text_embeddings.append(text_embed.cpu())
             valid_texts.append(text)
             valid_indices.append(idx)
+            logger.debug(f"Added to valid samples. Total valid: {len(valid_indices)}")
 
             # Generate negative captions based on available data
+            # Use clustered_adverb_lower for hierarchy lookup (case-insensitive), adverb for all_adverbs lookup
             should_generate = (
-                (hierarchy_antonym_map is not None and adverb in hierarchy_antonym_map) or
+                (hierarchy_antonym_map is not None and clustered_adverb_lower in hierarchy_antonym_map) or
                 (all_adverbs is not None and adverb in all_adverbs)
             )
 
+            logger.debug(f"Negative caption check:")
+            logger.debug(f"  adverb is not None: {adverb is not None}")
+            logger.debug(f"  hierarchy_antonym_map is not None: {hierarchy_antonym_map is not None}")
+            logger.debug(f"  clustered_adverb_lower in hierarchy: {clustered_adverb_lower in hierarchy_antonym_map if hierarchy_antonym_map and clustered_adverb_lower else False}")
+            logger.debug(f"  should_generate: {should_generate}")
+
             if adverb is not None and should_generate:
+                logger.debug(f"Generating negative captions...")
                 if hierarchy_antonym_map is not None:
                     # Use hierarchy-based approach with k replacements
+                    # Use adverb for replacement in text, but clustered_adverb_lower for hierarchy lookup
                     negative_texts, negative_adverbs = generate_negative_captions(
-                        text, adverb, antonym_map=hierarchy_antonym_map, k=args.k
+                        text, adverb, antonym_map=hierarchy_antonym_map, k=args.k, clustered_adverb=clustered_adverb_lower
                     )
+                    logger.debug(f"  Generated {len(negative_texts)} negative captions (hierarchy-based)")
                 else:
                     # Use all-adverbs approach
                     negative_texts, negative_adverbs = generate_negative_captions(
                         text, adverb, all_adverbs=all_adverbs
                     )
+                    logger.debug(f"  Generated {len(negative_texts)} negative captions (all-adverbs)")
 
                 if len(negative_texts) > 0:
-                    neg_inputs = tokenizer(negative_texts, return_tensors='pt', padding=True, truncation=True)
-                    neg_inputs = {k: v.to(args.device) for k, v in neg_inputs.items()}
+                    logger.debug(f"  Example negatives:")
+                    for i, (neg_text, neg_adv) in enumerate(zip(negative_texts[:3], negative_adverbs[:3])):
+                        logger.debug(f"    {i+1}. [{neg_adv}] \"{neg_text}\"")
 
+                    logger.debug(f"  Encoding {len(negative_texts)} negative captions...")
                     with torch.no_grad():
-                        neg_embeds = model.encode_text(neg_inputs)
+                        # Encode negative captions using X-CLIP
+                        neg_embeds = []
+                        for i, neg_text in enumerate(negative_texts):
+                            neg_text_inputs = processor(text=[neg_text], return_tensors="pt", padding=True)
+                            neg_text_inputs = {k: v.to(args.device) for k, v in neg_text_inputs.items()}
+                            neg_outputs = model.get_text_features(**neg_text_inputs)
+                            neg_embed = neg_outputs / neg_outputs.norm(dim=-1, keepdim=True)
+                            neg_embeds.append(neg_embed)
+                            if i < 3:
+                                logger.debug(f"    Negative {i+1} embed shape: {neg_embed.shape}")
+                        neg_embeds = torch.cat(neg_embeds, dim=0)
+                        logger.debug(f"  All negative embeds shape: {neg_embeds.shape}")
 
+                    logger.debug(f"  Computing adverb negative recall...")
                     recalls, gt_rank, scores = compute_adverb_negative_recall(
                         video_embed.cpu(), text_embed.cpu(), neg_embeds.cpu()
                     )
+                    logger.debug(f"  GT Rank: {gt_rank}/{len(negative_texts)+1}")
+                    logger.debug(f"  Recalls: {recalls}")
 
                     adverb_negative_examples.append({
                         'video_idx': len(valid_indices) - 1,
-                        'adverb': adverb,
+                        'adverb': clustered_adverb_lower if hierarchy_antonym_map is not None else adverb,
                         'original_text': text,
                         'negative_texts': negative_texts,
                         'negative_adverbs': negative_adverbs,
@@ -490,30 +612,47 @@ def main():
                         'recalls': recalls,
                         'scores': scores
                     })
+                    logger.debug(f"  Added to adverb negative examples. Total: {len(adverb_negative_examples)}")
+                else:
+                    logger.debug(f"  No negative captions generated")
 
         except Exception as e:
             logger.warning(f"Failed to process {video_path}: {e}")
+            logger.debug(f"Exception details: {type(e).__name__}: {str(e)}", exc_info=True)
             continue
+
+    logger.info(f"\n{'='*60}")
+    logger.info(f"PROCESSING SUMMARY")
+    logger.info(f"{'='*60}")
 
     if len(video_embeddings) == 0:
         logger.error("No valid samples found!")
         return
 
+    logger.debug(f"Concatenating {len(video_embeddings)} video embeddings...")
     video_embeddings = torch.cat(video_embeddings, dim=0)
+    logger.debug(f"Concatenating {len(text_embeddings)} text embeddings...")
     text_embeddings = torch.cat(text_embeddings, dim=0)
 
-    logger.info(f"\nProcessed {len(valid_indices)} samples successfully")
+    logger.info(f"Total samples in dataset: {len(df)}")
+    logger.info(f"Successfully processed: {len(valid_indices)}")
+    logger.info(f"Failed/Skipped: {len(df) - len(valid_indices)}")
     logger.info(f"Video embeddings shape: {video_embeddings.shape}")
     logger.info(f"Text embeddings shape: {text_embeddings.shape}")
     logger.info(f"Adverb negative samples: {len(adverb_negative_examples)}")
+    logger.debug(f"Valid indices: {valid_indices}")
 
+    logger.debug(f"Computing similarity matrix...")
     similarity = compute_similarity(video_embeddings, text_embeddings)
+    logger.debug(f"Similarity matrix shape: {similarity.shape}")
 
     logger.info("\n" + "="*60)
     logger.info("STANDARD VIDEO-TO-TEXT RETRIEVAL")
     logger.info("(Each video queries ALL captions in dataset)")
     logger.info("="*60)
+    logger.debug(f"Computing V2T recalls...")
     v2t_recalls = compute_recall(similarity)
+    logger.debug(f"V2T recalls: {v2t_recalls}")
     for metric, value in v2t_recalls.items():
         logger.info(f"  {metric}: {value:.2f}%")
 
@@ -523,7 +662,9 @@ def main():
     logger.info("STANDARD TEXT-TO-VIDEO RETRIEVAL")
     logger.info("(Each caption queries ALL videos in dataset)")
     logger.info("="*60)
+    logger.debug(f"Computing T2V recalls (transposed similarity)...")
     t2v_recalls = compute_recall(similarity.T)
+    logger.debug(f"T2V recalls: {t2v_recalls}")
     for metric, value in t2v_recalls.items():
         logger.info(f"  {metric}: {value:.2f}%")
 
@@ -593,12 +734,15 @@ def main():
 
     avg_r1 = (v2t_recalls['R@1'] + t2v_recalls['R@1']) / 2
     avg_r5 = (v2t_recalls['R@5'] + t2v_recalls['R@5']) / 2
-    avg_r10 = (v2t_recalls['R@10'] + t2v_recalls['R@10']) / 2
+    avg_r10 = (v2t_recalls.get('R@10', float('nan')) + t2v_recalls.get('R@10', float('nan'))) / 2
 
     logger.info(f"\nAverage (V2T + T2V):")
     logger.info(f"  R@1: {avg_r1:.2f}%")
     logger.info(f"  R@5: {avg_r5:.2f}%")
-    logger.info(f"  R@10: {avg_r10:.2f}%")
+    if not np.isnan(avg_r10):
+        logger.info(f"  R@10: {avg_r10:.2f}%")
+    else:
+        logger.info(f"  R@10: nan%")
 
     if len(adverb_negative_examples) > 0:
         logger.info(f"\nAdverb Negative V2T Retrieval:")
