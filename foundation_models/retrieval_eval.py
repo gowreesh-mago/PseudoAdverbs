@@ -13,9 +13,133 @@ import json
 import csv
 import random
 from torch.utils.data import Dataset
+from abc import ABC, abstractmethod
+from datetime import datetime
+from typing import List, Dict, Tuple, Optional
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# ABSTRACT MODEL INTERFACE
+# ============================================================================
+
+class VideoTextModel(ABC):
+    """Abstract base class for video-text models."""
+
+    def __init__(self, model_name: str, device: str = 'cuda'):
+        self.model_name = model_name
+        self.device = device
+        self.model = None
+        self.processor = None
+
+    @abstractmethod
+    def load_model(self):
+        """Load the model and processor."""
+        pass
+
+    @abstractmethod
+    def encode_video(self, video_frames: List[Image.Image]) -> torch.Tensor:
+        """
+        Encode video frames into embeddings.
+
+        Args:
+            video_frames: List of PIL Images
+
+        Returns:
+            torch.Tensor of shape (1, embedding_dim) - normalized embeddings
+        """
+        pass
+
+    @abstractmethod
+    def encode_text(self, texts: List[str]) -> torch.Tensor:
+        """
+        Encode text into embeddings.
+
+        Args:
+            texts: List of text strings
+
+        Returns:
+            torch.Tensor of shape (len(texts), embedding_dim) - normalized embeddings
+        """
+        pass
+
+    def eval_mode(self):
+        """Set model to evaluation mode."""
+        if self.model is not None:
+            self.model.eval()
+
+# ============================================================================
+# X-CLIP MODEL WRAPPER
+# ============================================================================
+
+class XCLIPModelWrapper(VideoTextModel):
+    """Wrapper for X-CLIP model."""
+
+    def load_model(self):
+        """Load X-CLIP model and processor."""
+        logger.info(f"Loading X-CLIP model: {self.model_name}")
+        self.processor = XCLIPProcessor.from_pretrained(self.model_name)
+        self.model = XCLIPModel.from_pretrained(self.model_name)
+        self.model = self.model.to(self.device)
+        self.model.eval()
+        logger.info(f"X-CLIP model loaded successfully")
+
+    def encode_video(self, video_frames: List[Image.Image]) -> torch.Tensor:
+        """Encode video frames using X-CLIP."""
+        with torch.no_grad():
+            logger.debug(f"Processing video with X-CLIP processor...")
+            inputs = self.processor(videos=[video_frames], return_tensors="pt", padding=True)
+            logger.debug(f"  Video input shapes: {[(k, v.shape) for k, v in inputs.items()]}")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            video_outputs = self.model.get_video_features(**inputs)
+            logger.debug(f"  Video features shape: {video_outputs.shape}")
+            # Normalize
+            video_embed = video_outputs / video_outputs.norm(dim=-1, keepdim=True)
+            logger.debug(f"  Normalized video embed shape: {video_embed.shape}")
+            return video_embed
+
+    def encode_text(self, texts: List[str]) -> torch.Tensor:
+        """Encode text using X-CLIP."""
+        with torch.no_grad():
+            logger.debug(f"Processing {len(texts)} text(s) with X-CLIP processor...")
+            text_inputs = self.processor(text=texts, return_tensors="pt", padding=True)
+            logger.debug(f"  Text input shapes: {[(k, v.shape) for k, v in text_inputs.items()]}")
+            text_inputs = {k: v.to(self.device) for k, v in text_inputs.items()}
+            text_outputs = self.model.get_text_features(**text_inputs)
+            logger.debug(f"  Text features shape: {text_outputs.shape}")
+            # Normalize
+            text_embed = text_outputs / text_outputs.norm(dim=-1, keepdim=True)
+            logger.debug(f"  Normalized text embed shape: {text_embed.shape}")
+            return text_embed
+
+# ============================================================================
+# MODEL FACTORY
+# ============================================================================
+
+def create_model(model_name: str, device: str) -> VideoTextModel:
+    """
+    Factory function to create model based on model name.
+
+    Args:
+        model_name: Name of the model (e.g., 'microsoft/xclip-base-patch32')
+        device: Device to load model on
+
+    Returns:
+        VideoTextModel instance
+    """
+    # Determine model type based on name
+    if 'xclip' in model_name.lower():
+        model = XCLIPModelWrapper(model_name, device)
+    else:
+        raise ValueError(f"Unknown model type: {model_name}. Supported models: X-CLIP")
+
+    model.load_model()
+    return model
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 
 def load_antonym_mapping(json_path):
     with open(json_path, 'r') as f:
@@ -48,7 +172,7 @@ def parse_args():
     parser.add_argument('--num_examples', type=int, default=5)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--output_dir', type=str, default=None,
-                        help='Directory to save per-adverb metrics CSV (if not provided, results are only logged)')
+                        help='Directory to save logs and metrics (CSV and JSON files). If not provided, results are only logged to console.')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug logging for detailed execution trace')
     parser.add_argument('--use_time_limits', action='store_true',
@@ -60,6 +184,42 @@ def load_adverb_data(adverbs_file):
     antonym_map = dict(zip(df['adverb'], df['antonym']))
     all_adverbs = list(set(df['adverb'].tolist() + df['antonym'].tolist()))
     return antonym_map, all_adverbs
+
+def setup_logging(output_dir: Optional[str] = None, debug: bool = False):
+    """
+    Setup logging to both console and file.
+
+    Args:
+        output_dir: Directory to save log file (if None, only logs to console)
+        debug: Enable debug logging
+    """
+    # Set logging level
+    log_level = logging.DEBUG if debug else logging.INFO
+    logger.setLevel(log_level)
+
+    # Clear existing handlers
+    logger.handlers.clear()
+
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+
+    # File handler if output_dir is specified
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_file = os.path.join(output_dir, f'retrieval_eval_{timestamp}.log')
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(log_level)
+        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
+        logger.addHandler(file_handler)
+        logger.info(f"Logging to file: {log_file}")
+
+    return output_dir
 
 def replace_adverb_in_caption(caption, adverb, replacements, k=1):
     """
@@ -356,7 +516,7 @@ def log_adverb_negative_examples(examples, num_examples=5):
 
 def compute_per_adverb_metrics(examples):
     """
-    Compute comprehensive per-adverb metrics.
+    Compute comprehensive per-adverb metrics for negative retrieval.
 
     Returns:
         Dictionary mapping adverb -> metrics dict with R@1, R@3, R@5, MRR, ranks, etc.
@@ -402,12 +562,75 @@ def compute_per_adverb_metrics(examples):
         }
     return per_adverb
 
+def compute_per_adverb_standard_retrieval(similarity_matrix, adverbs, direction='v2t', k_values=[1, 5, 10]):
+    """
+    Compute per-adverb metrics for standard retrieval (v2t or t2v).
+
+    Args:
+        similarity_matrix: Similarity matrix of shape (n_videos, n_texts) for v2t or transposed for t2v
+        adverbs: List of adverbs corresponding to each sample
+        direction: 'v2t' or 't2v'
+        k_values: List of k values for R@k metrics
+
+    Returns:
+        Dictionary mapping adverb -> metrics dict
+    """
+    n = similarity_matrix.shape[0]
+    adverb_results = {}
+
+    for idx in range(n):
+        adv = adverbs[idx]
+        if adv not in adverb_results:
+            adverb_results[adv] = {
+                'total': 0,
+                'ranks': [],
+                'reciprocal_ranks': []
+            }
+            for k in k_values:
+                adverb_results[adv][f'r{k}_correct'] = 0
+
+        # Compute rank for this sample
+        if direction == 'v2t':
+            rankings = similarity_matrix[idx].argsort(descending=True)
+        else:  # t2v
+            rankings = similarity_matrix[:, idx].argsort(descending=True)
+
+        gt_rank = (rankings == idx).nonzero(as_tuple=True)[0].item() + 1
+
+        adverb_results[adv]['total'] += 1
+        adverb_results[adv]['ranks'].append(gt_rank)
+        adverb_results[adv]['reciprocal_ranks'].append(1.0 / gt_rank)
+
+        # Track R@k metrics
+        for k in k_values:
+            if k <= similarity_matrix.shape[1] and gt_rank <= k:
+                adverb_results[adv][f'r{k}_correct'] += 1
+
+    # Compute final metrics
+    per_adverb = {}
+    for adv, data in adverb_results.items():
+        metrics = {
+            'count': data['total'],
+            'mean_rank': np.mean(data['ranks']),
+            'median_rank': np.median(data['ranks']),
+            'MRR': np.mean(data['reciprocal_ranks']) * 100
+        }
+        for k in k_values:
+            if k <= similarity_matrix.shape[1]:
+                metrics[f'R@{k}'] = data[f'r{k}_correct'] / data['total'] * 100
+            else:
+                metrics[f'R@{k}'] = float('nan')
+        per_adverb[adv] = metrics
+
+    return per_adverb
+
 def main():
     args = parse_args()
 
-    # Enable debug logging if requested
+    # Setup logging
+    setup_logging(output_dir=args.output_dir, debug=args.debug)
+
     if args.debug:
-        logger.setLevel(logging.DEBUG)
         logger.info("Debug logging ENABLED")
 
     logger.info(f"{'='*60}")
@@ -427,12 +650,9 @@ def main():
     logger.debug(f"Debug logging: ENABLED")
     logger.info(f"{'='*60}\n")
 
-    logger.info(f"Loading model: {args.model_name}")
-    processor = XCLIPProcessor.from_pretrained(args.model_name)
-    model = XCLIPModel.from_pretrained(args.model_name)
-    model = model.to(args.device)
-    model.eval()
-    logger.info(f"Model loaded successfully\n")
+    # Create model using factory
+    model = create_model(args.model_name, args.device)
+    model.eval_mode()
 
     # Load adverb data - either from hierarchy JSON or CSV
     if args.hierarchy:
@@ -479,6 +699,7 @@ def main():
     text_embeddings = []
     valid_texts = []
     valid_indices = []
+    valid_adverbs = []  # Track adverbs for per-adverb metrics
     adverb_negative_examples = []
 
     logger.info("Computing embeddings...")
@@ -518,31 +739,16 @@ def main():
             text = row['caption'] if 'caption' in row else f"{row['action']} {row['adverb']}"
             logger.debug(f"Caption: \"{text}\"")
 
-            with torch.no_grad():
-                # X-CLIP API: use processor and model
-                # Pass video frames as a list wrapped in another list (batch of videos)
-                logger.debug(f"Processing video with X-CLIP processor...")
-                inputs = processor(videos=[video_frames], return_tensors="pt", padding=True)
-                logger.debug(f"  Video input shapes: {[(k, v.shape) for k, v in inputs.items()]}")
-                inputs = {k: v.to(args.device) for k, v in inputs.items()}
-                video_outputs = model.get_video_features(**inputs)
-                logger.debug(f"  Video features shape: {video_outputs.shape}")
-                video_embed = video_outputs / video_outputs.norm(dim=-1, keepdim=True)
-                logger.debug(f"  Normalized video embed shape: {video_embed.shape}")
-
-                logger.debug(f"Processing text with X-CLIP processor...")
-                text_inputs = processor(text=[text], return_tensors="pt", padding=True)
-                logger.debug(f"  Text input shapes: {[(k, v.shape) for k, v in text_inputs.items()]}")
-                text_inputs = {k: v.to(args.device) for k, v in text_inputs.items()}
-                text_outputs = model.get_text_features(**text_inputs)
-                logger.debug(f"  Text features shape: {text_outputs.shape}")
-                text_embed = text_outputs / text_outputs.norm(dim=-1, keepdim=True)
-                logger.debug(f"  Normalized text embed shape: {text_embed.shape}")
+            # Encode video and text using model interface
+            video_embed = model.encode_video(video_frames)
+            text_embed = model.encode_text([text])
 
             video_embeddings.append(video_embed.cpu())
             text_embeddings.append(text_embed.cpu())
             valid_texts.append(text)
             valid_indices.append(idx)
+            # Store adverb for per-adverb metrics (use clustered_adverb_lower for consistency)
+            valid_adverbs.append(clustered_adverb_lower if clustered_adverb_lower else adverb)
             logger.debug(f"Added to valid samples. Total valid: {len(valid_indices)}")
 
             # Generate negative captions based on available data
@@ -580,19 +786,15 @@ def main():
                         logger.debug(f"    {i+1}. [{neg_adv}] \"{neg_text}\"")
 
                     logger.debug(f"  Encoding {len(negative_texts)} negative captions...")
-                    with torch.no_grad():
-                        # Encode negative captions using X-CLIP
-                        neg_embeds = []
-                        for i, neg_text in enumerate(negative_texts):
-                            neg_text_inputs = processor(text=[neg_text], return_tensors="pt", padding=True)
-                            neg_text_inputs = {k: v.to(args.device) for k, v in neg_text_inputs.items()}
-                            neg_outputs = model.get_text_features(**neg_text_inputs)
-                            neg_embed = neg_outputs / neg_outputs.norm(dim=-1, keepdim=True)
-                            neg_embeds.append(neg_embed)
-                            if i < 3:
-                                logger.debug(f"    Negative {i+1} embed shape: {neg_embed.shape}")
-                        neg_embeds = torch.cat(neg_embeds, dim=0)
-                        logger.debug(f"  All negative embeds shape: {neg_embeds.shape}")
+                    # Encode negative captions using model interface
+                    neg_embeds = []
+                    for i, neg_text in enumerate(negative_texts):
+                        neg_embed = model.encode_text([neg_text])
+                        neg_embeds.append(neg_embed)
+                        if i < 3:
+                            logger.debug(f"    Negative {i+1} embed shape: {neg_embed.shape}")
+                    neg_embeds = torch.cat(neg_embeds, dim=0)
+                    logger.debug(f"  All negative embeds shape: {neg_embeds.shape}")
 
                     logger.debug(f"  Computing adverb negative recall...")
                     recalls, gt_rank, scores = compute_adverb_negative_recall(
@@ -658,6 +860,12 @@ def main():
 
     log_retrieval_examples(similarity, valid_texts, direction='v2t', num_examples=args.num_examples)
 
+    # Compute per-adverb metrics for V2T
+    logger.debug("Computing per-adverb metrics for V2T...")
+    per_adverb_v2t = compute_per_adverb_standard_retrieval(
+        similarity, valid_adverbs, direction='v2t', k_values=[1, 5, 10]
+    )
+
     logger.info("\n" + "="*60)
     logger.info("STANDARD TEXT-TO-VIDEO RETRIEVAL")
     logger.info("(Each caption queries ALL videos in dataset)")
@@ -669,6 +877,12 @@ def main():
         logger.info(f"  {metric}: {value:.2f}%")
 
     log_retrieval_examples(similarity, valid_texts, direction='t2v', num_examples=args.num_examples)
+
+    # Compute per-adverb metrics for T2V
+    logger.debug("Computing per-adverb metrics for T2V...")
+    per_adverb_t2v = compute_per_adverb_standard_retrieval(
+        similarity.T, valid_adverbs, direction='t2v', k_values=[1, 5, 10]
+    )
 
     if len(adverb_negative_examples) > 0:
         logger.info("\n" + "="*60)
@@ -693,31 +907,102 @@ def main():
         log_adverb_negative_examples(adverb_negative_examples, num_examples=args.num_examples)
 
         logger.info("\n" + "="*60)
-        logger.info("PER-ADVERB NEGATIVE RETRIEVAL RESULTS")
+        logger.info("PER-ADVERB NEGATIVE RETRIEVAL RESULTS (Video-to-Text with Negatives)")
         logger.info("="*60)
 
-        per_adverb = compute_per_adverb_metrics(adverb_negative_examples)
-        sorted_adverbs = sorted(per_adverb.items(), key=lambda x: x[1]['R@1'], reverse=True)
+        per_adverb_neg = compute_per_adverb_metrics(adverb_negative_examples)
+        sorted_adverbs_neg = sorted(per_adverb_neg.items(), key=lambda x: x[1]['R@1'], reverse=True)
 
         logger.info(f"{'Adverb':<20} | {'R@1':>7} | {'R@3':>7} | {'R@5':>7} | {'MRR':>7} | {'Count':>6} | {'Mean Rank':>10} | {'Median Rank':>12} | {'Avg Cands':>10}")
         logger.info("-" * 120)
-        for adv, metrics in sorted_adverbs:
+        for adv, metrics in sorted_adverbs_neg:
             logger.info(f"{adv:<20} | {metrics['R@1']:6.2f}% | {metrics['R@3']:6.2f}% | {metrics['R@5']:6.2f}% | {metrics['MRR']:6.2f}% | {metrics['count']:6d} | {metrics['mean_rank']:10.2f} | {metrics['median_rank']:12.1f} | {metrics['mean_candidates']:10.1f}")
 
-        # Save per-adverb metrics to CSV if output_dir is specified
-        if args.output_dir:
-            os.makedirs(args.output_dir, exist_ok=True)
-            csv_path = os.path.join(args.output_dir, 'per_adverb_metrics.csv')
+    # Display per-adverb metrics for V2T
+    logger.info("\n" + "="*60)
+    logger.info("PER-ADVERB VIDEO-TO-TEXT RETRIEVAL RESULTS")
+    logger.info("="*60)
+    sorted_adverbs_v2t = sorted(per_adverb_v2t.items(), key=lambda x: x[1]['R@1'], reverse=True)
+    logger.info(f"{'Adverb':<20} | {'R@1':>7} | {'R@5':>7} | {'R@10':>7} | {'MRR':>7} | {'Count':>6} | {'Mean Rank':>10} | {'Median Rank':>12}")
+    logger.info("-" * 100)
+    for adv, metrics in sorted_adverbs_v2t:
+        logger.info(f"{adv:<20} | {metrics['R@1']:6.2f}% | {metrics['R@5']:6.2f}% | {metrics.get('R@10', float('nan')):6.2f}% | {metrics['MRR']:6.2f}% | {metrics['count']:6d} | {metrics['mean_rank']:10.2f} | {metrics['median_rank']:12.1f}")
 
-            with open(csv_path, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=['adverb', 'R@1', 'R@3', 'R@5', 'MRR', 'count', 'mean_rank', 'median_rank', 'mean_candidates'])
+    # Display per-adverb metrics for T2V
+    logger.info("\n" + "="*60)
+    logger.info("PER-ADVERB TEXT-TO-VIDEO RETRIEVAL RESULTS")
+    logger.info("="*60)
+    sorted_adverbs_t2v = sorted(per_adverb_t2v.items(), key=lambda x: x[1]['R@1'], reverse=True)
+    logger.info(f"{'Adverb':<20} | {'R@1':>7} | {'R@5':>7} | {'R@10':>7} | {'MRR':>7} | {'Count':>6} | {'Mean Rank':>10} | {'Median Rank':>12}")
+    logger.info("-" * 100)
+    for adv, metrics in sorted_adverbs_t2v:
+        logger.info(f"{adv:<20} | {metrics['R@1']:6.2f}% | {metrics['R@5']:6.2f}% | {metrics.get('R@10', float('nan')):6.2f}% | {metrics['MRR']:6.2f}% | {metrics['count']:6d} | {metrics['mean_rank']:10.2f} | {metrics['median_rank']:12.1f}")
+
+    # Save per-adverb metrics to CSV files if output_dir is specified
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+
+        # Save V2T per-adverb metrics
+        v2t_csv_path = os.path.join(args.output_dir, 'per_adverb_v2t.csv')
+        with open(v2t_csv_path, 'w', newline='') as f:
+            fieldnames = ['adverb', 'R@1', 'R@5', 'R@10', 'MRR', 'count', 'mean_rank', 'median_rank']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for adv, metrics in sorted_adverbs_v2t:
+                row = {'adverb': adv}
+                row.update(metrics)
+                writer.writerow(row)
+        logger.info(f"\nPer-adverb V2T metrics saved to: {v2t_csv_path}")
+
+        # Save T2V per-adverb metrics
+        t2v_csv_path = os.path.join(args.output_dir, 'per_adverb_t2v.csv')
+        with open(t2v_csv_path, 'w', newline='') as f:
+            fieldnames = ['adverb', 'R@1', 'R@5', 'R@10', 'MRR', 'count', 'mean_rank', 'median_rank']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for adv, metrics in sorted_adverbs_t2v:
+                row = {'adverb': adv}
+                row.update(metrics)
+                writer.writerow(row)
+        logger.info(f"Per-adverb T2V metrics saved to: {t2v_csv_path}")
+
+        # Save negative retrieval per-adverb metrics if available
+        if len(adverb_negative_examples) > 0:
+            neg_csv_path = os.path.join(args.output_dir, 'per_adverb_negatives.csv')
+            with open(neg_csv_path, 'w', newline='') as f:
+                fieldnames = ['adverb', 'R@1', 'R@3', 'R@5', 'MRR', 'count', 'mean_rank', 'median_rank', 'mean_candidates']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
-                for adv, metrics in sorted_adverbs:
+                for adv, metrics in sorted_adverbs_neg:
                     row = {'adverb': adv}
                     row.update(metrics)
                     writer.writerow(row)
+            logger.info(f"Per-adverb negative metrics saved to: {neg_csv_path}")
 
-            logger.info(f"\nPer-adverb metrics saved to: {csv_path}")
+        # Save overall summary metrics
+        summary_path = os.path.join(args.output_dir, 'summary_metrics.json')
+        summary = {
+            'model_name': args.model_name,
+            'total_samples': len(valid_indices),
+            'v2t': {k: float(v) for k, v in v2t_recalls.items()},
+            't2v': {k: float(v) for k, v in t2v_recalls.items()},
+            'average': {
+                'R@1': float((v2t_recalls['R@1'] + t2v_recalls['R@1']) / 2),
+                'R@5': float((v2t_recalls['R@5'] + t2v_recalls['R@5']) / 2),
+                'R@10': float((v2t_recalls.get('R@10', float('nan')) + t2v_recalls.get('R@10', float('nan'))) / 2)
+            }
+        }
+        if len(adverb_negative_examples) > 0:
+            summary['negatives'] = {
+                'samples': len(adverb_negative_examples),
+                'R@1': float(np.mean(all_r1)),
+                'R@3': float(np.mean(all_r3)),
+                'R@5': float(np.mean(all_r5)),
+                'mean_rank': float(np.mean(all_ranks))
+            }
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        logger.info(f"Summary metrics saved to: {summary_path}")
 
     logger.info("\n" + "="*60)
     logger.info("OVERALL PERFORMANCE SUMMARY")
