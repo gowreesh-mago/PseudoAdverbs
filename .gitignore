@@ -4,3 +4,5 @@ __pycache__/
 checkpoints/
 wandb_config.json
 VATEX_Adverbs_features/
+.DS_Store  
+datasets/glove.6B.300d.txt
