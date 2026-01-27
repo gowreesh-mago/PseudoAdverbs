@@ -173,6 +173,8 @@ def parse_args():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--output_dir', type=str, default=None,
                         help='Directory to save logs and metrics (CSV and JSON files). If not provided, results are only logged to console.')
+    parser.add_argument('--no_save', action='store_true',
+                        help='Disable saving any output files (logs, metrics). Only display results in console.')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug logging for detailed execution trace')
     parser.add_argument('--use_time_limits', action='store_true',
@@ -185,13 +187,14 @@ def load_adverb_data(adverbs_file):
     all_adverbs = list(set(df['adverb'].tolist() + df['antonym'].tolist()))
     return antonym_map, all_adverbs
 
-def setup_logging(output_dir: Optional[str] = None, debug: bool = False):
+def setup_logging(output_dir: Optional[str] = None, debug: bool = False, no_save: bool = False):
     """
     Setup logging to both console and file.
 
     Args:
         output_dir: Directory to save log file (if None, only logs to console)
         debug: Enable debug logging
+        no_save: If True, disable file logging even if output_dir is specified
     """
     # Set logging level
     log_level = logging.DEBUG if debug else logging.INFO
@@ -207,8 +210,8 @@ def setup_logging(output_dir: Optional[str] = None, debug: bool = False):
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
 
-    # File handler if output_dir is specified
-    if output_dir:
+    # File handler if output_dir is specified and no_save is False
+    if output_dir and not no_save:
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         log_file = os.path.join(output_dir, f'retrieval_eval_{timestamp}.log')
@@ -628,10 +631,13 @@ def main():
     args = parse_args()
 
     # Setup logging
-    setup_logging(output_dir=args.output_dir, debug=args.debug)
+    setup_logging(output_dir=args.output_dir, debug=args.debug, no_save=args.no_save)
 
     if args.debug:
         logger.info("Debug logging ENABLED")
+
+    if args.no_save:
+        logger.info("File saving DISABLED (--no_save flag set)")
 
     logger.info(f"{'='*60}")
     logger.info(f"EVALUATION CONFIGURATION")
@@ -647,6 +653,7 @@ def main():
     logger.info(f"Seed: {args.seed}")
     logger.info(f"K (negatives): {args.k}")
     logger.info(f"Output dir: {args.output_dir}")
+    logger.info(f"Save files: {not args.no_save}")
     logger.debug(f"Debug logging: ENABLED")
     logger.info(f"{'='*60}\n")
 
@@ -938,8 +945,8 @@ def main():
     for adv, metrics in sorted_adverbs_t2v:
         logger.info(f"{adv:<20} | {metrics['R@1']:6.2f}% | {metrics['R@5']:6.2f}% | {metrics.get('R@10', float('nan')):6.2f}% | {metrics['MRR']:6.2f}% | {metrics['count']:6d} | {metrics['mean_rank']:10.2f} | {metrics['median_rank']:12.1f}")
 
-    # Save per-adverb metrics to CSV files if output_dir is specified
-    if args.output_dir:
+    # Save per-adverb metrics to CSV files if output_dir is specified and no_save is False
+    if args.output_dir and not args.no_save:
         os.makedirs(args.output_dir, exist_ok=True)
 
         # Save V2T per-adverb metrics
@@ -1003,6 +1010,8 @@ def main():
         with open(summary_path, 'w') as f:
             json.dump(summary, f, indent=2)
         logger.info(f"Summary metrics saved to: {summary_path}")
+    elif args.no_save:
+        logger.info("\nFile saving disabled. All results displayed in console only.")
 
     logger.info("\n" + "="*60)
     logger.info("OVERALL PERFORMANCE SUMMARY")
