@@ -18,9 +18,6 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 
-# Add parent directory to path to import Qwen3VLEmbedder
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'scripts'))
-from qwen3_vl_embedding import Qwen3VLEmbedder
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
