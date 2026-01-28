@@ -6,7 +6,10 @@ import torch
 import torch.optim as optim
 import time
 import gc
-from utils import save_args, introduce_adverbs, save_checkpoint, calculate_p1, calculate_mean_p1, AverageMeter
+from utils import (save_args, introduce_adverbs, save_checkpoint,
+                   calculate_p1, calculate_p5, calculate_mean_p1,
+                   calculate_p1_action, calculate_p5_action,
+                   calculate_p1_pair, calculate_p5_pair, AverageMeter)
 
 from opts import parser
 from dataset import AdverbDataset
@@ -290,36 +293,123 @@ def train(model, train_loader, optimizer, writer, epoch, unlabelled_ratio, pseud
     return adverb_thresholds
 
 def test(model, test_loader, evaluator, writer, epoch, args):
+    """
+    Comprehensive evaluation with multiple metrics:
+
+    Score tensors explained:
+    - scores: Raw scores for ALL (adverb, action) pairs
+    - action_gt_scores: Masked to keep only pairs with ground truth action (for adverb selection given action)
+    - antonym_action_gt_scores: Masked to keep only (adverb_gt OR antonym, action_gt) pairs (binary adverb choice)
+
+    Metrics:
+    1. Constrained adverb accuracy: Given GT action, distinguish adverb from its antonym
+    2. Unconstrained adverb accuracy: Predict adverb from all possibilities
+    3. Action accuracy: Predict action from all possibilities
+    4. Pair accuracy: Predict exact (action, adverb) pair
+    All metrics have top-1 and top-5 variants.
+    """
     model.eval()
-    accuracies = []
+
+    # Batch-wise accuracies
+    adverb_constrained_accs = []
+    adverb_unconstrained_accs = []
+    action_accs = []
+    pair_accs = []
+
+    # Accumulated for global metrics
+    all_scores = torch.Tensor().cuda()
     all_antonym_action_gt_scores = torch.Tensor().cuda()
     all_adverb_gt = torch.Tensor().cuda()
+    all_action_gt = torch.Tensor().cuda()
+
     for idx, data in tqdm.tqdm(enumerate(test_loader), total=len(test_loader)):
         data = [d.cuda() for d in data]
         predictions = model(data)[1]
         adverb_gt, action_gt = data[1], data[2]
         scores, action_gt_scores, antonym_action_gt_scores = evaluator.get_scores(predictions, action_gt, adverb_gt)
+
+        # Accumulate scores and ground truth for global metrics
+        all_scores = torch.cat([all_scores, scores])
         all_antonym_action_gt_scores = torch.cat([all_antonym_action_gt_scores, antonym_action_gt_scores])
         all_adverb_gt = torch.cat([all_adverb_gt, adverb_gt])
-        acc = calculate_p1(model.dset, antonym_action_gt_scores.cpu(), adverb_gt.cpu())
-        print('E %d | Video-to-Adverb Antonym P@1: %.3f'%(epoch, acc))
-        accuracies.append(acc)
-    acc_mean = calculate_mean_p1(model.dset, all_antonym_action_gt_scores.cpu(), all_adverb_gt.cpu())
-    writer.add_scalar('Acc/Test/Video-to-Adverb Antonym', sum(accuracies)/len(accuracies), epoch)
-    writer.add_scalar('Acc/Test/Video-to-Adverb Antonym Mean', acc_mean, epoch)
-    
-    # Log test metrics to wandb
+        all_action_gt = torch.cat([all_action_gt, action_gt])
+
+        # Calculate batch-wise accuracies
+        # 1. Constrained adverb: Given GT action, choose between adverb and antonym
+        adverb_constrained_acc = calculate_p1(model.dset, antonym_action_gt_scores.cpu(), adverb_gt.cpu())
+
+        # 2. Unconstrained adverb: Predict adverb from all pairs (extracts adverb from best pair)
+        adverb_unconstrained_acc = calculate_p1(model.dset, scores.cpu(), adverb_gt.cpu())
+
+        # 3. Action: Predict action from all pairs (extracts action from best pair)
+        action_acc = calculate_p1_action(model.dset, scores.cpu(), action_gt.cpu())
+
+        # 4. Pair: Predict exact (action, adverb) combination
+        pair_acc = calculate_p1_pair(model.dset, scores.cpu(), adverb_gt.cpu(), action_gt.cpu())
+
+        print('E %d | Adverb-Constrained: %.3f | Adverb: %.3f | Action: %.3f | Pair: %.3f'%(
+            epoch, adverb_constrained_acc, adverb_unconstrained_acc, action_acc, pair_acc))
+
+        adverb_constrained_accs.append(adverb_constrained_acc)
+        adverb_unconstrained_accs.append(adverb_unconstrained_acc)
+        action_accs.append(action_acc)
+        pair_accs.append(pair_acc)
+
+    # Calculate overall top-1 metrics (micro-averaged across batches)
+    adverb_constrained_p1 = sum(adverb_constrained_accs) / len(adverb_constrained_accs)
+    adverb_unconstrained_p1 = sum(adverb_unconstrained_accs) / len(adverb_unconstrained_accs)
+    action_p1 = sum(action_accs) / len(action_accs)
+    pair_p1 = sum(pair_accs) / len(pair_accs)
+
+    # Calculate balanced adverb accuracy (macro-averaged per class)
+    adverb_constrained_balanced = calculate_mean_p1(model.dset, all_antonym_action_gt_scores.cpu(), all_adverb_gt.cpu())
+    adverb_unconstrained_balanced = calculate_mean_p1(model.dset, all_scores.cpu(), all_adverb_gt.cpu())
+
+    # Calculate top-5 metrics on accumulated data
+    adverb_constrained_p5 = calculate_p5(model.dset, all_antonym_action_gt_scores.cpu(), all_adverb_gt.cpu())
+    adverb_unconstrained_p5 = calculate_p5(model.dset, all_scores.cpu(), all_adverb_gt.cpu())
+    action_p5 = calculate_p5_action(model.dset, all_scores.cpu(), all_action_gt.cpu())
+    pair_p5 = calculate_p5_pair(model.dset, all_scores.cpu(), all_adverb_gt.cpu(), all_action_gt.cpu())
+
+    # Log to TensorBoard
+    writer.add_scalar('Acc/Test/Adverb-Constrained-P1', adverb_constrained_p1, epoch)
+    writer.add_scalar('Acc/Test/Adverb-Constrained-Balanced', adverb_constrained_balanced, epoch)
+    writer.add_scalar('Acc/Test/Adverb-Constrained-P5', adverb_constrained_p5, epoch)
+    writer.add_scalar('Acc/Test/Adverb-P1', adverb_unconstrained_p1, epoch)
+    writer.add_scalar('Acc/Test/Adverb-Balanced', adverb_unconstrained_balanced, epoch)
+    writer.add_scalar('Acc/Test/Adverb-P5', adverb_unconstrained_p5, epoch)
+    writer.add_scalar('Acc/Test/Action-P1', action_p1, epoch)
+    writer.add_scalar('Acc/Test/Action-P5', action_p5, epoch)
+    writer.add_scalar('Acc/Test/Pair-P1', pair_p1, epoch)
+    writer.add_scalar('Acc/Test/Pair-P5', pair_p5, epoch)
+
+    # Log test metrics to wandb with organized naming
     if not args.no_wandb:
         wandb.log({
-            'test/video_to_adverb_antonym_acc': sum(accuracies)/len(accuracies),
-            'test/video_to_adverb_antonym_mean': acc_mean
+            # Constrained adverb metrics (given GT action, choose from adverb/antonym)
+            'test/adverb_constrained/top1_accuracy': adverb_constrained_p1,
+            'test/adverb_constrained/balanced_accuracy': adverb_constrained_balanced,
+            'test/adverb_constrained/top5_accuracy': adverb_constrained_p5,
+
+            # Unconstrained adverb metrics (predict adverb from all pairs)
+            'test/adverb/top1_accuracy': adverb_unconstrained_p1,
+            'test/adverb/balanced_accuracy': adverb_unconstrained_balanced,
+            'test/adverb/top5_accuracy': adverb_unconstrained_p5,
+
+            # Action metrics (predict action from all pairs)
+            'test/action/top1_accuracy': action_p1,
+            'test/action/top5_accuracy': action_p5,
+
+            # Pair metrics (predict exact action-adverb combination)
+            'test/pair/top1_accuracy': pair_p1,
+            'test/pair/top5_accuracy': pair_p5,
         })
 
-def calculate_p1_action(dset, scores, action_gt):
-    pair_pred = np.argmax(scores.numpy(), axis=1)
-    action_pred = [dset.action2idx[dset.pairs[pred][1]] for pred in pair_pred]
-    acc = (action_pred == action_gt.cpu().numpy()).mean()
-    return acc
+    print('\n=== Epoch %d Test Results ==='%epoch)
+    print('Adverb (Constrained): P@1=%.3f, Balanced=%.3f, P@5=%.3f'%(adverb_constrained_p1, adverb_constrained_balanced, adverb_constrained_p5))
+    print('Adverb (Unconstrained): P@1=%.3f, Balanced=%.3f, P@5=%.3f'%(adverb_unconstrained_p1, adverb_unconstrained_balanced, adverb_unconstrained_p5))
+    print('Action: P@1=%.3f, P@5=%.3f'%(action_p1, action_p5))
+    print('Pair: P@1=%.3f, P@5=%.3f\n'%(pair_p1, pair_p5))
 
 if __name__ == '__main__':
     args = parser.parse_args()
