@@ -89,13 +89,61 @@ class XCLIPModelWrapper(VideoTextModel):
         """Encode video frames using X-CLIP."""
         with torch.no_grad():
             logger.debug(f"Processing video with X-CLIP processor...")
-            inputs = self.processor(videos=[video_frames], return_tensors="pt", padding=True)
+            logger.debug(f"  Input: {len(video_frames)} frames")
+            logger.debug(f"  Frame types: {[type(f) for f in video_frames[:3]]}")
+            if len(video_frames) > 0:
+                logger.debug(f"  First frame size: {video_frames[0].size}, mode: {video_frames[0].mode}")
+
+            # Convert PIL Images to numpy array as expected by XCLIPProcessor
+            # Processor expects: videos=list(video) where video is np.ndarray of shape (num_frames, H, W, C)
+            logger.debug(f"  Converting PIL images to numpy array...")
+            video_array = np.stack([np.array(frame) for frame in video_frames])
+            logger.debug(f"  Video array shape: {video_array.shape}")
+
+            # Try calling the video_processor/image_processor directly
+            # In transformers 5.0, XCLIPProcessor has video_processor attribute
+            logger.debug(f"  Trying direct video_processor call...")
+            try:
+                if hasattr(self.processor, 'video_processor'):
+                    logger.debug(f"  Using processor.video_processor")
+                    inputs = self.processor.video_processor(videos=list(video_array), return_tensors="pt")
+                elif hasattr(self.processor, 'image_processor'):
+                    logger.debug(f"  Using processor.image_processor with videos parameter")
+                    inputs = self.processor.image_processor(videos=list(video_array), return_tensors="pt")
+                else:
+                    logger.debug(f"  Falling back to main processor")
+                    inputs = self.processor(videos=list(video_array), return_tensors="pt")
+            except Exception as e:
+                logger.debug(f"  Direct processor call failed: {e}")
+                logger.debug(f"  Trying with images parameter instead...")
+                # Try processing as images instead
+                inputs = self.processor.image_processor(images=video_frames, return_tensors="pt")
+
+            logger.debug(f"  Processor returned {len(inputs)} items")
+            logger.debug(f"  Processor keys: {list(inputs.keys())}")
             logger.debug(f"  Video input shapes: {[(k, v.shape) for k, v in inputs.items()]}")
+
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             video_outputs = self.model.get_video_features(**inputs)
-            logger.debug(f"  Video features shape: {video_outputs.shape}")
+            logger.debug(f"  Video features type: {type(video_outputs)}")
+
+            # Extract embeddings from BaseModelOutputWithPooling
+            # get_video_features returns a BaseModelOutputWithPooling object
+            # We want the pooler_output which contains the video embeddings
+            if hasattr(video_outputs, 'pooler_output'):
+                video_features = video_outputs.pooler_output
+                logger.debug(f"  Using pooler_output, shape: {video_features.shape}")
+            elif hasattr(video_outputs, 'last_hidden_state'):
+                # Fallback: use mean pooling of last hidden state
+                video_features = video_outputs.last_hidden_state.mean(dim=1)
+                logger.debug(f"  Using mean-pooled last_hidden_state, shape: {video_features.shape}")
+            else:
+                # If it's already a tensor
+                video_features = video_outputs
+                logger.debug(f"  Using direct output, shape: {video_features.shape}")
+
             # Normalize
-            video_embed = video_outputs / video_outputs.norm(dim=-1, keepdim=True)
+            video_embed = video_features / video_features.norm(dim=-1, keepdim=True)
             logger.debug(f"  Normalized video embed shape: {video_embed.shape}")
             return video_embed
 
@@ -107,9 +155,22 @@ class XCLIPModelWrapper(VideoTextModel):
             logger.debug(f"  Text input shapes: {[(k, v.shape) for k, v in text_inputs.items()]}")
             text_inputs = {k: v.to(self.device) for k, v in text_inputs.items()}
             text_outputs = self.model.get_text_features(**text_inputs)
-            logger.debug(f"  Text features shape: {text_outputs.shape}")
+            logger.debug(f"  Text features type: {type(text_outputs)}")
+
+            # Extract embeddings from BaseModelOutputWithPooling if needed
+            if hasattr(text_outputs, 'pooler_output'):
+                text_features = text_outputs.pooler_output
+                logger.debug(f"  Using pooler_output, shape: {text_features.shape}")
+            elif hasattr(text_outputs, 'last_hidden_state'):
+                text_features = text_outputs.last_hidden_state.mean(dim=1)
+                logger.debug(f"  Using mean-pooled last_hidden_state, shape: {text_features.shape}")
+            else:
+                # Already a tensor
+                text_features = text_outputs
+                logger.debug(f"  Using direct output, shape: {text_features.shape}")
+
             # Normalize
-            text_embed = text_outputs / text_outputs.norm(dim=-1, keepdim=True)
+            text_embed = text_features / text_features.norm(dim=-1, keepdim=True)
             logger.debug(f"  Normalized text embed shape: {text_embed.shape}")
             return text_embed
 
