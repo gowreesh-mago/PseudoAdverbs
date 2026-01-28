@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import numpy as np
 import pandas as pd
@@ -16,6 +17,10 @@ from torch.utils.data import Dataset
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
+
+# Add parent directory to path to import Qwen3VLEmbedder
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'scripts'))
+from qwen3_vl_embedding import Qwen3VLEmbedder
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -657,7 +662,7 @@ def compute_per_adverb_standard_retrieval(similarity_matrix, adverbs, direction=
         if direction == 'v2t':
             rankings = similarity_matrix[idx].argsort(descending=True)
         else:  # t2v
-            rankings = similarity_matrix[:, idx].argsort(descending=True)
+            rankings = similarity_matrix[idx].argsort(descending=True)
 
         gt_rank = (rankings == idx).nonzero(as_tuple=True)[0].item() + 1
 
@@ -690,6 +695,13 @@ def compute_per_adverb_standard_retrieval(similarity_matrix, adverbs, direction=
 
 def main():
     args = parse_args()
+
+    # Set random seeds for reproducibility
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     # Setup logging
     setup_logging(output_dir=args.output_dir, debug=args.debug, no_save=args.no_save)
