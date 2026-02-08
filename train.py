@@ -6,6 +6,10 @@ import torch
 import torch.optim as optim
 import time
 import gc
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import seaborn as sns
 from utils import save_args, introduce_adverbs, save_checkpoint, calculate_p1, calculate_mean_p1, AverageMeter
 
 from opts import parser
@@ -346,6 +350,8 @@ def train_classification(model, train_loader, optimizer, criterion, writer, epoc
     total_loss = 0.0
     total_acc = 0.0
     num_batches = 0
+    all_logits = []
+    all_labels = []
 
     for idx, data in tqdm.tqdm(enumerate(train_loader), total=len(train_loader)):
         features = data[0].cuda()
@@ -374,6 +380,10 @@ def train_classification(model, train_loader, optimizer, criterion, writer, epoc
         total_acc += accuracy.item()
         num_batches += 1
 
+        # Store for epoch-level metrics
+        all_logits.append(logits.detach())
+        all_labels.append(labels)
+
         # Log step-level metrics to wandb
         if not args.no_wandb:
             step_wandb_log = {
@@ -383,20 +393,66 @@ def train_classification(model, train_loader, optimizer, criterion, writer, epoc
             wandb.log(step_wandb_log)
 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0
-    avg_acc = total_correct / total_samples if num_batches > 0 else 0
+    avg_acc = total_acc / num_batches if num_batches > 0 else 0
 
-    writer.add_scalar('Loss/Train/Classification', avg_loss, epoch)
-    writer.add_scalar('Acc/Train/Classification', avg_acc, epoch)
+    # Calculate joint metrics for the entire epoch
+    if len(all_logits) > 0:
+        all_logits = torch.cat(all_logits, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
 
-    # Log to wandb
-    if not args.no_wandb:
-        wandb.log({
-            'epoch': epoch,
-            'train/classification_loss': avg_loss,
-            'train/classification_accuracy': avg_acc,
-        })
+        # Get evaluator from model's dataset
+        from model import ClassificationEvaluator
+        evaluator = ClassificationEvaluator(model.dset)
+        joint_metrics = evaluator.calculate_joint_metrics(all_logits, all_labels)
 
-    print(f'E: {epoch} | Classification Loss: {avg_loss:.4f} | Accuracy: {avg_acc:.4f}')
+        # Calculate top-5 metrics
+        top5_action_acc = evaluator.calculate_top_k_action_accuracy(all_logits, all_labels, k=5)
+        top5_adverb_acc = evaluator.calculate_top_k_adverb_accuracy(all_logits, all_labels, k=5)
+        top5_joint_acc = evaluator.calculate_top_k_joint_accuracy(all_logits, all_labels, k=5)
+
+        # Log to TensorBoard
+        writer.add_scalar('Loss/Train/Classification', avg_loss, epoch)
+        writer.add_scalar('Acc/Train/Classification', avg_acc, epoch)
+        writer.add_scalar('Acc/Train/Joint_Accuracy', joint_metrics['joint_accuracy'], epoch)
+        writer.add_scalar('Acc/Train/Action_Only_Accuracy', joint_metrics['action_accuracy'], epoch)
+        writer.add_scalar('Acc/Train/Adverb_Only_Accuracy', joint_metrics['adverb_accuracy'], epoch)
+        writer.add_scalar('Acc/Train/Top5_Action_Accuracy', top5_action_acc, epoch)
+        writer.add_scalar('Acc/Train/Top5_Adverb_Accuracy', top5_adverb_acc, epoch)
+        writer.add_scalar('Acc/Train/Top5_Joint_Accuracy', top5_joint_acc, epoch)
+        writer.add_scalar('Metrics/Train/Action_F1', joint_metrics['action_f1'], epoch)
+        writer.add_scalar('Metrics/Train/Adverb_F1', joint_metrics['adverb_f1'], epoch)
+
+        # Log to wandb
+        if not args.no_wandb:
+            wandb.log({
+                'epoch': epoch,
+                'train/classification_loss': avg_loss,
+                'train/classification_accuracy': avg_acc,
+                'train/joint_accuracy': joint_metrics['joint_accuracy'],
+                'train/action_accuracy': joint_metrics['action_accuracy'],
+                'train/adverb_accuracy': joint_metrics['adverb_accuracy'],
+                'train/top5_action_accuracy': top5_action_acc,
+                'train/top5_adverb_accuracy': top5_adverb_acc,
+                'train/top5_joint_accuracy': top5_joint_acc,
+                'train/action_f1': joint_metrics['action_f1'],
+                'train/adverb_f1': joint_metrics['adverb_f1'],
+            })
+
+        print(f'E: {epoch} | Classification Loss: {avg_loss:.4f} | Accuracy: {avg_acc:.4f}')
+        print(f'  Joint Acc: {joint_metrics["joint_accuracy"]:.4f} | Action Acc: {joint_metrics["action_accuracy"]:.4f} | Adverb Acc: {joint_metrics["adverb_accuracy"]:.4f}')
+        print(f'  Top-5 Joint: {top5_joint_acc:.4f} | Top-5 Action: {top5_action_acc:.4f} | Top-5 Adverb: {top5_adverb_acc:.4f}')
+    else:
+        writer.add_scalar('Loss/Train/Classification', avg_loss, epoch)
+        writer.add_scalar('Acc/Train/Classification', avg_acc, epoch)
+
+        if not args.no_wandb:
+            wandb.log({
+                'epoch': epoch,
+                'train/classification_loss': avg_loss,
+                'train/classification_accuracy': avg_acc,
+            })
+
+        print(f'E: {epoch} | Classification Loss: {avg_loss:.4f} | Accuracy: {avg_acc:.4f}')
 
 def test_classification(model, test_loader, evaluator, criterion, writer, epoch, args):
     """Testing function for classification mode."""
@@ -432,24 +488,113 @@ def test_classification(model, test_loader, evaluator, criterion, writer, epoch,
     all_logits = torch.cat(all_logits, dim=0)
     all_labels = torch.cat(all_labels, dim=0)
 
-    # Calculate metrics
+    # Calculate basic metrics
     avg_loss = total_loss / len(test_loader)
     top1_acc = evaluator.calculate_accuracy(all_logits, all_labels)
     top5_acc = evaluator.calculate_top_k_accuracy(all_logits, all_labels, k=5)
 
+    # Calculate top-5 metrics for action, adverb, and joint
+    top5_action_acc = evaluator.calculate_top_k_action_accuracy(all_logits, all_labels, k=5)
+    top5_adverb_acc = evaluator.calculate_top_k_adverb_accuracy(all_logits, all_labels, k=5)
+    top5_joint_acc = evaluator.calculate_top_k_joint_accuracy(all_logits, all_labels, k=5)
+
+    # Calculate joint action-adverb metrics
+    joint_metrics = evaluator.calculate_joint_metrics(all_logits, all_labels)
+
+    # Calculate confusion matrices
+    confusion_matrices = evaluator.get_confusion_matrices(all_logits, all_labels)
+
+    # Log to TensorBoard
     writer.add_scalar('Loss/Test/Classification', avg_loss, epoch)
     writer.add_scalar('Acc/Test/Classification_Top1', top1_acc, epoch)
     writer.add_scalar('Acc/Test/Classification_Top5', top5_acc, epoch)
 
+    # Log top-5 metrics to TensorBoard
+    writer.add_scalar('Acc/Test/Top5_Action_Accuracy', top5_action_acc, epoch)
+    writer.add_scalar('Acc/Test/Top5_Adverb_Accuracy', top5_adverb_acc, epoch)
+    writer.add_scalar('Acc/Test/Top5_Joint_Accuracy', top5_joint_acc, epoch)
+
+    # Log joint metrics to TensorBoard
+    writer.add_scalar('Acc/Test/Joint_Accuracy', joint_metrics['joint_accuracy'], epoch)
+    writer.add_scalar('Acc/Test/Action_Only_Accuracy', joint_metrics['action_accuracy'], epoch)
+    writer.add_scalar('Acc/Test/Adverb_Only_Accuracy', joint_metrics['adverb_accuracy'], epoch)
+    writer.add_scalar('Metrics/Test/Action_Precision', joint_metrics['action_precision'], epoch)
+    writer.add_scalar('Metrics/Test/Action_Recall', joint_metrics['action_recall'], epoch)
+    writer.add_scalar('Metrics/Test/Action_F1', joint_metrics['action_f1'], epoch)
+    writer.add_scalar('Metrics/Test/Adverb_Precision', joint_metrics['adverb_precision'], epoch)
+    writer.add_scalar('Metrics/Test/Adverb_Recall', joint_metrics['adverb_recall'], epoch)
+    writer.add_scalar('Metrics/Test/Adverb_F1', joint_metrics['adverb_f1'], epoch)
+
+    # Log per-action accuracies
+    for action_name, acc in joint_metrics['per_action_accuracy'].items():
+        writer.add_scalar(f'Acc/Test/PerAction/{action_name}', acc, epoch)
+
+    # Log per-adverb accuracies
+    for adverb_name, acc in joint_metrics['per_adverb_accuracy'].items():
+        writer.add_scalar(f'Acc/Test/PerAdverb/{adverb_name}', acc, epoch)
+
     # Log to wandb
     if not args.no_wandb:
-        wandb.log({
+        wandb_log = {
             'test/classification_loss': avg_loss,
             'test/classification_top1_accuracy': top1_acc,
             'test/classification_top5_accuracy': top5_acc,
-        })
+            'test/top5_action_accuracy': top5_action_acc,
+            'test/top5_adverb_accuracy': top5_adverb_acc,
+            'test/top5_joint_accuracy': top5_joint_acc,
+            'test/joint_accuracy': joint_metrics['joint_accuracy'],
+            'test/action_accuracy': joint_metrics['action_accuracy'],
+            'test/adverb_accuracy': joint_metrics['adverb_accuracy'],
+            'test/action_precision': joint_metrics['action_precision'],
+            'test/action_recall': joint_metrics['action_recall'],
+            'test/action_f1': joint_metrics['action_f1'],
+            'test/adverb_precision': joint_metrics['adverb_precision'],
+            'test/adverb_recall': joint_metrics['adverb_recall'],
+            'test/adverb_f1': joint_metrics['adverb_f1'],
+        }
 
+        # Add per-action accuracies to wandb
+        for action_name, acc in joint_metrics['per_action_accuracy'].items():
+            wandb_log[f'test/per_action_acc/{action_name}'] = acc
+
+        # Add per-adverb accuracies to wandb
+        for adverb_name, acc in joint_metrics['per_adverb_accuracy'].items():
+            wandb_log[f'test/per_adverb_acc/{adverb_name}'] = acc
+
+        # Log confusion matrices as images to wandb
+        # Action confusion matrix
+        fig, ax = plt.subplots(figsize=(12, 10))
+        sns.heatmap(confusion_matrices['action_confusion'],
+                    annot=False, fmt='d', cmap='Blues', ax=ax,
+                    xticklabels=list(evaluator.action2idx.keys()),
+                    yticklabels=list(evaluator.action2idx.keys()))
+        ax.set_xlabel('Predicted Action')
+        ax.set_ylabel('True Action')
+        ax.set_title(f'Action Confusion Matrix (Epoch {epoch})')
+        plt.tight_layout()
+        wandb_log['test/action_confusion_matrix'] = wandb.Image(fig)
+        plt.close(fig)
+
+        # Adverb confusion matrix
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sns.heatmap(confusion_matrices['adverb_confusion'],
+                    annot=True, fmt='d', cmap='Greens', ax=ax,
+                    xticklabels=list(evaluator.adverb2idx.keys()),
+                    yticklabels=list(evaluator.adverb2idx.keys()))
+        ax.set_xlabel('Predicted Adverb')
+        ax.set_ylabel('True Adverb')
+        ax.set_title(f'Adverb Confusion Matrix (Epoch {epoch})')
+        plt.tight_layout()
+        wandb_log['test/adverb_confusion_matrix'] = wandb.Image(fig)
+        plt.close(fig)
+
+        wandb.log(wandb_log)
+
+    # Print summary
     print(f'E: {epoch} | Test Loss: {avg_loss:.4f} | Top-1 Acc: {top1_acc:.4f} | Top-5 Acc: {top5_acc:.4f}')
+    print(f'  Joint Acc: {joint_metrics["joint_accuracy"]:.4f} | Action Acc: {joint_metrics["action_accuracy"]:.4f} | Adverb Acc: {joint_metrics["adverb_accuracy"]:.4f}')
+    print(f'  Top-5 Joint: {top5_joint_acc:.4f} | Top-5 Action: {top5_action_acc:.4f} | Top-5 Adverb: {top5_adverb_acc:.4f}')
+    print(f'  Action F1: {joint_metrics["action_f1"]:.4f} | Adverb F1: {joint_metrics["adverb_f1"]:.4f}')
 
 def calculate_p1_action(dset, scores, action_gt):
     pair_pred = np.argmax(scores.numpy(), axis=1)
