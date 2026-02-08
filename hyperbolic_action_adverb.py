@@ -249,16 +249,6 @@ class Model(nn.Module):
             nn.ReLU(),
             nn.Linear(config['hidden_dim'], config['output_dim'])
         )
-        self.action_encoder_video = nn.Sequential(
-            nn.Linear(config['output_dim'], config['bottleneck_dim']),
-            nn.ReLU(),
-            nn.Linear(config['bottleneck_dim'], config['output_dim'])
-        )
-        self.adverb_encoder_video = nn.Sequential(
-            nn.Linear(config['output_dim'], config['bottleneck_dim']),
-            nn.ReLU(),
-            nn.Linear(config['bottleneck_dim'], config['output_dim'])
-        )
 
         
         # Create embeddings with GloVe dimension
@@ -368,9 +358,7 @@ class Model(nn.Module):
     def get_video_features(self, flow, rgb):
         video_input = torch.cat((flow, rgb), dim=-1)
         video_features = self.video_encoder(video_input)
-        action_features_video = self.action_encoder_video(video_features)
-        adverb_features_video = self.adverb_encoder_video(video_features)
-        return video_features, action_features_video, adverb_features_video
+        return video_features
 
     def get_text_features(self, actions, adverbs, action_parents, adverb_parents):
         action_indices = torch.LongTensor([self.action_2_idx[a.lower()] for a in actions]).to(self.config['device'])
@@ -387,7 +375,7 @@ class Model(nn.Module):
     
     def forward(self, batch, mode='train'):
         if mode == 'train':
-            video_features, action_features_video, adverb_features_video = self.get_video_features(batch['flow'], batch['rgb'])
+            video_features = self.get_video_features(batch['flow'], batch['rgb'])
             action_embeds, adverb_embeds, action_parent_embeds, adverb_parent_embeds = self.get_text_features(
                 batch['actions'], batch['adverbs'], batch['action_parents'], batch['adverb_parents'])
 
@@ -397,13 +385,11 @@ class Model(nn.Module):
                 'video_features': video_features,
                 'action_parent_embeds': action_parent_embeds,
                 'adverb_parent_embeds': adverb_parent_embeds,
-                'action_features_video': action_features_video,
-                'adverb_features_video': adverb_features_video,
                 'combined_action_adverb': combined_action_adverb,
             }
         else:
             # For evaluation, get video features and all possible text embeddings
-            video_features, action_features_video, adverb_features_video = self.get_video_features(batch['flow'], batch['rgb'])
+            video_features = self.get_video_features(batch['flow'], batch['rgb'])
 
             # Get all action and adverb embeddings
             all_action_indices = torch.arange(len(self.action_vocab)).to(self.config['device'])
@@ -435,8 +421,6 @@ class Model(nn.Module):
 
             return {
                 'video_features': video_features,  # (batch_size, output_dim)
-                'action_features_video': action_features_video,  # (batch_size, output_dim)
-                'adverb_features_video': adverb_features_video,  # (batch_size, output_dim)
                 'all_action_embeds': all_action_embeds,  # (num_actions, output_dim)
                 'all_adverb_embeds': all_adverb_embeds,  # (num_adverbs, output_dim)
                 'all_combined_action_adverb': all_combined_action_adverb,  # (num_actions * num_adverbs, output_dim)
@@ -468,24 +452,16 @@ class HyperbolicTrainerModule(nn.Module):
             video_features_hyp = self.poincare_ops.exp_map(outputs_euclidean['video_features'])
             action_parent_embeds_hyp = self.poincare_ops.exp_map(outputs_euclidean['action_parent_embeds'])
             adverb_parent_embeds_hyp = self.poincare_ops.exp_map(outputs_euclidean['adverb_parent_embeds'])
-            action_features_video_hyp = self.poincare_ops.exp_map(outputs_euclidean['action_features_video'])
-            adverb_features_video_hyp = self.poincare_ops.exp_map(outputs_euclidean['adverb_features_video'])
             combined_action_adverb_hyp = self.poincare_ops.exp_map(outputs_euclidean['combined_action_adverb'])
             return {
                 'video_features_hyp': video_features_hyp,
                 'action_parent_embeds_hyp': action_parent_embeds_hyp,
                 'adverb_parent_embeds_hyp': adverb_parent_embeds_hyp,
-                'action_features_video_hyp': action_features_video_hyp,
-                'adverb_features_video_hyp': adverb_features_video_hyp,
                 'combined_action_adverb_hyp': combined_action_adverb_hyp,
             }
         else:
             # Evaluation mode: compute similarity scores
             outputs_euclidean = self.model(batch, mode='eval')
-
-            # Map all features to hyperbolic space
-            action_features_video_hyp = self.poincare_ops.exp_map(outputs_euclidean['action_features_video'])  # (batch_size, output_dim)
-            adverb_features_video_hyp = self.poincare_ops.exp_map(outputs_euclidean['adverb_features_video'])  # (batch_size, output_dim)
             video_features_hyp = self.poincare_ops.exp_map(outputs_euclidean['video_features'])  # (batch_size, output_dim)
 
             all_action_embeds_hyp = self.poincare_ops.exp_map(outputs_euclidean['all_action_embeds'])  # (num_actions, output_dim)
@@ -496,11 +472,11 @@ class HyperbolicTrainerModule(nn.Module):
             # action_features_video_hyp: (batch_size, output_dim)
             # all_action_embeds_hyp: (num_actions, output_dim)
             # We need to compute distance for each batch item against all actions
-            action_sim = self.compute_batch_similarity(action_features_video_hyp, all_action_embeds_hyp)  # (batch_size, num_actions)
+            action_sim = self.compute_batch_similarity(video_features_hyp, all_action_embeds_hyp)  # (batch_size, num_actions)
             action_probs = torch.softmax(action_sim, dim=1)  # (batch_size, num_actions)
 
             # Compute adverb probabilities: similarity between adverb_features_video and all_adverb_embeds
-            adverb_sim = self.compute_batch_similarity(adverb_features_video_hyp, all_adverb_embeds_hyp)  # (batch_size, num_adverbs)
+            adverb_sim = self.compute_batch_similarity(video_features_hyp, all_adverb_embeds_hyp)  # (batch_size, num_adverbs)
             adverb_probs = torch.softmax(adverb_sim, dim=1)  # (batch_size, num_adverbs)
 
             # Compute composition probabilities: similarity between video_features and all_combined
@@ -660,53 +636,144 @@ class TaxonomicEntailmentLoss(nn.Module):
     def __init__(self, manifold, gamma=0.1, curvature_value=1.0):
         super().__init__()
         self.manifold = manifold
-        self.gamma = gamma  # Boundary condition parameter
+        self.gamma = gamma  # Boundary condition parameter (min_radius)
         # Store curvature value directly
         self.c_val = curvature_value
 
+    def half_aperture_poincare(self, x, eps=1e-8):
+        """
+        Compute the half aperture angle of the entailment cone for points in Poincare ball.
+        Adapted from Lorentz model implementation.
+
+        Args:
+            x: Tensor (B, D) - points in Poincare ball
+            eps: Small float for numerical stability
+
+        Returns:
+            Tensor (B,) - half aperture angles in (0, pi/2)
+        """
+        # Extract underlying tensor if ManifoldTensor
+        if isinstance(x, ManifoldTensor):
+            x_t = x.tensor
+        else:
+            x_t = x
+
+        # Compute norm of points
+        x_norm = torch.norm(x_t, dim=-1).clamp(min=eps)
+
+        # Half aperture formula for Poincare ball
+        # Similar to Lorentz: sin(aperture) = 2 * gamma / (sqrt(c) * ||x||)
+        c_sqrt = torch.sqrt(torch.tensor(self.c_val, device=x_t.device, dtype=x_t.dtype))
+        asin_input = 2 * self.gamma / (c_sqrt * x_norm + eps)
+        asin_input = asin_input.clamp(-1.0 + eps, 1.0 - eps)
+
+        aperture = torch.asin(asin_input)
+        return aperture
+
+    def oxy_angle_poincare(self, x, y, eps=1e-8):
+        """
+        Compute the exterior angle at x in the hyperbolic triangle Oxy in Poincare ball,
+        where O is the origin of the Poincare ball.
+
+        Uses the Hyperbolic law of cosines, adapted from Lorentz model implementation.
+
+        Args:
+            x: Tensor (B, D) - parent points in Poincare ball
+            y: Tensor (B, D) - child points in Poincare ball
+            eps: Small float for numerical stability
+
+        Returns:
+            Tensor (B,) - exterior angles at x in (0, pi)
+        """
+        # Extract underlying tensors if ManifoldTensor
+        if isinstance(x, ManifoldTensor):
+            x_t = x.tensor
+        else:
+            x_t = x
+
+        if isinstance(y, ManifoldTensor):
+            y_t = y.tensor
+        else:
+            y_t = y
+
+        # Compute norms (Euclidean norms in Poincare ball)
+        x_norm = torch.norm(x_t, dim=-1).clamp(min=eps)
+        y_norm = torch.norm(y_t, dim=-1).clamp(min=eps)
+
+        # Compute hyperbolic distance from origin to x and y
+        # In Poincare ball: d(O, x) = (1/sqrt(c)) * arctanh(sqrt(c) * ||x||)
+        c_sqrt = torch.sqrt(torch.tensor(self.c_val, device=x_t.device, dtype=x_t.dtype))
+
+        # Clamp norms to stay within valid range for Poincare ball (< 1/sqrt(c))
+        max_norm = 1.0 / (c_sqrt + eps) - eps
+        x_norm_clamped = x_norm.clamp(max=max_norm)
+        y_norm_clamped = y_norm.clamp(max=max_norm)
+
+        # Distance from origin
+        d_O_x = torch.atanh(c_sqrt * x_norm_clamped) / c_sqrt
+        d_O_y = torch.atanh(c_sqrt * y_norm_clamped) / c_sqrt
+
+        # Compute distance between x and y using manifold
+        # Create ManifoldTensors if needed
+        if not isinstance(x, ManifoldTensor):
+            x_manifold = ManifoldTensor(data=x_t, man_dim=1, manifold=self.manifold)
+        else:
+            x_manifold = x
+
+        if not isinstance(y, ManifoldTensor):
+            y_manifold = ManifoldTensor(data=y_t, man_dim=1, manifold=self.manifold)
+        else:
+            y_manifold = y
+
+        d_x_y = self.manifold.dist(x_manifold, y_manifold).clamp(min=eps)
+
+        # Hyperbolic law of cosines to find angle at x:
+        # cosh(d_x_y) = cosh(d_O_x) * cosh(d_O_y) - sinh(d_O_x) * sinh(d_O_y) * cos(angle)
+        #
+        # Solving for cos(angle):
+        # cos(angle) = (cosh(d_O_x) * cosh(d_O_y) - cosh(d_x_y)) / (sinh(d_O_x) * sinh(d_O_y))
+
+        cosh_d_O_x = torch.cosh(d_O_x)
+        cosh_d_O_y = torch.cosh(d_O_y)
+        cosh_d_x_y = torch.cosh(d_x_y)
+        sinh_d_O_x = torch.sinh(d_O_x)
+        sinh_d_O_y = torch.sinh(d_O_y)
+
+        # Numerator
+        numerator = cosh_d_O_x * cosh_d_O_y - cosh_d_x_y
+
+        # Denominator (with small epsilon to avoid division by zero)
+        denominator = sinh_d_O_x * sinh_d_O_y + eps
+
+        # Compute cosine of angle
+        cos_angle = numerator / denominator
+        cos_angle = cos_angle.clamp(-1.0 + eps, 1.0 - eps)
+
+        # Compute angle
+        angle = torch.acos(cos_angle)
+
+        return angle
+
     def entailment_cone_loss(self, parent, child):
         """
-        Compute entailment loss for parent-child relationship
-        Child should lie within parent's entailment cone
+        Compute entailment loss for parent-child relationship in Poincare ball.
+        Child should lie within parent's entailment cone.
+
+        Uses proper Poincare ball geometry with hyperbolic law of cosines,
+        matching the Lorentz model implementation.
 
         Args:
             parent, child: Points on Poincare ball (B, D) - ManifoldTensor
         Returns:
             Loss (B,)
         """
-        # Extract underlying tensors if ManifoldTensor
-        if isinstance(parent, ManifoldTensor):
-            parent_t = parent.tensor
-        else:
-            parent_t = parent
+        # Compute the exterior angle at parent in triangle (origin, parent, child)
+        angle = self.oxy_angle_poincare(parent, child)
 
-        if isinstance(child, ManifoldTensor):
-            child_t = child.tensor
-        else:
-            child_t = child
+        # Compute the aperture of the parent's entailment cone
+        aperture = self.half_aperture_poincare(parent)
 
-        # Compute angle between parent and child from origin
-        # In Poincare ball, we use the norm and distance
-        parent_norm = torch.norm(parent_t, dim=-1, keepdim=True).clamp(min=1e-7)
-        child_norm = torch.norm(child_t, dim=-1, keepdim=True).clamp(min=1e-7)
-
-        # Cosine similarity in ambient space (approximation for small curvature)
-        cos_angle = (parent_t * child_t).sum(dim=-1) / (parent_norm.squeeze() * child_norm.squeeze() + 1e-7)
-        # Clamp to slightly tighter range to avoid numerical issues with acos
-        cos_angle = cos_angle.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
-
-        # Exterior angle to the cone
-        angle = torch.acos(cos_angle)
-
-        # Aperture of the cone (depends on parent's distance from origin)
-        # Closer to origin = more general = wider cone
-        c_sqrt = torch.sqrt(torch.tensor(self.c_val, device=parent_t.device))
-        sin_arg = 2 * self.gamma / (c_sqrt * parent_norm.squeeze() + 1e-7)
-        sin_arg = sin_arg.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
-        aperture = torch.arcsin(sin_arg)
-        aperture = aperture.clamp(0, np.pi / 2)
-
-        # Loss is positive if child is outside the cone
+        # Loss is positive if child is outside the cone (angle > aperture)
         loss = F.relu(angle - aperture)
 
         return loss
