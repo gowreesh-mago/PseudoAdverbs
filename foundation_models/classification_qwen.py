@@ -10,6 +10,7 @@ import pandas as pd
 from PIL import Image
 import decord
 from decord import VideoReader, cpu
+import torch
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from tqdm import tqdm
 import json
@@ -318,20 +319,32 @@ if __name__ == "__main__":
             continue
 
         parsed = None
+        prompt = system_prompt
         for attempt in range(args.max_retries):
-            try:                                                                                   
-                output =inference(video_path, system_prompt, model, processor,         max_new_tokens=512)                                                                                 
-            except Exception as e:                                                                 
-                print(                                                                             
-                f"[WARN] clip={clip_id} attempt={attempt+1}: inference error ({e}), retrying", 
-                file=sys.stderr,                                                               
-                )                                                                                  
-                continue 
+            try:
+                with torch.no_grad():
+                    output = inference(video_path, prompt, model, processor, max_new_tokens=512)
+                print(f"[DEBUG] clip={clip_id} attempt={attempt+1}: model output: {output}")
+                if attempt > 0:
+                    print(f"[DEBUG] prompt: {prompt[:]}")
+            except Exception as e:
+                print(
+                    f"[WARN] clip={clip_id} attempt={attempt+1}: inference error ({e}), retrying",
+                    file=sys.stderr,
+                )
+                continue
             parsed = parse_action_adverb_output(output)
             if parsed is None:
                 print(
                     f"[WARN] clip={clip_id} attempt={attempt+1}: parse failed, output was: {output}, retrying",
                     file=sys.stderr,
+                )
+                prompt = (
+                    system_prompt
+                    + "\n\nIMPORTANT: Your previous response could not be parsed as JSON. "
+                    "Respond with ONLY a valid JSON object and nothing else. "
+                    'Example: {"action": "run", "action_category": "locomotion", '
+                    '"adverb": "quickly", "adverb_category": "speed"}'
                 )
                 continue
             is_valid, errors = validate_classification(parsed, action_hierarchy, adverb_hierarchy)
@@ -340,6 +353,14 @@ if __name__ == "__main__":
                     f"[WARN] clip={clip_id} attempt={attempt+1}: hierarchy validation failed "
                     f"({errors}), retrying",
                     file=sys.stderr,
+                )
+                all_actions_flat = [a for acts in action_hierarchy.values() for a in acts]
+                all_adverbs_flat = [a for advs in adverb_hierarchy.values() for a in advs]
+                prompt = (
+                    system_prompt
+                    + f"\n\nIMPORTANT: Your previous answer was invalid — {errors}. "
+                    f"You MUST choose the action from this exact list: {all_actions_flat}. "
+                    f"You MUST choose the adverb from this exact list: {all_adverbs_flat}."
                 )
                 parsed = None
                 continue
