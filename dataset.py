@@ -194,29 +194,18 @@ class AdverbDataset(data.Dataset):
     def _setup_classification_classes(self):
         """Setup classification classes and mappings."""
         if self.class_mode == 'present_only':
-            # Only use action-adverb pairs present in training data
+            # Use action-adverb pairs present in training or test data
             train_pairs = set([(row[self.action_key], row[self.adverb_key])
                               for _, row in self.train_list.iterrows()])
-            self.class_pairs = sorted(list(train_pairs))
+            test_pairs = set([(row[self.action_key], row[self.adverb_key])
+                             for _, row in self.test_list.iterrows()])
+            # Union of train and test to ensure both datasets have valid classes
+            all_present_pairs = train_pairs | test_pairs
+            self.class_pairs = sorted(list(all_present_pairs))
         elif self.class_mode == 'all_classes':
-            # Use all possible action-adverb combinations + antonyms
-            all_pairs = set()
-            # Add all combinations from training data
-            for _, row in self.train_list.iterrows():
-                action, adverb = row[self.action_key], row[self.adverb_key]
-                all_pairs.add((action, adverb))
-                # Add antonym pair if available
-                if adverb in self.antonyms:
-                    all_pairs.add((action, self.antonyms[adverb]))
-
-            # Add all test combinations too
-            for _, row in self.test_list.iterrows():
-                action, adverb = row[self.action_key], row[self.adverb_key]
-                all_pairs.add((action, adverb))
-                if adverb in self.antonyms:
-                    all_pairs.add((action, self.antonyms[adverb]))
-
-            self.class_pairs = sorted(list(all_pairs))
+            # Use all possible action-adverb combinations
+            all_pairs = list(itertools.product(self.actions, self.adverbs))
+            self.class_pairs = sorted(all_pairs)
 
         # Create mappings
         self.class2idx = {pair: idx for idx, pair in enumerate(self.class_pairs)}
