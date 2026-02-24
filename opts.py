@@ -59,7 +59,7 @@ parser.add_argument('--glove-path', type=str, default='glove.6B.300d.txt', help=
 
 # Classification mode arguments
 parser.add_argument('--classification-mode', action='store_true', default=False, help='Use classification instead of metric learning')
-parser.add_argument('--class-mode', type=str, choices=['present_only', 'all_classes'], default='present_only',
+parser.add_argument('--class-mode', type=str, choices=['present_only', 'all_classes'], default='all_classes',
                     help='Classification class mode: present_only (only training pairs) or all_classes (all combinations + antonyms)')
 parser.add_argument('--manifold', type=str, default='euclidean', choices=['euclidean', 'hyperbolic'],
                     help='Manifold type for embeddings (for compatibility, not used in classification)')
