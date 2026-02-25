@@ -607,7 +607,31 @@ class Trainer:
         inner_adverb_top5 = MulticlassAccuracy(num_classes=self.num_adverbs, top_k=5).to(self.device)
 
         dist_action_parent_top1 = MulticlassAccuracy(num_classes=self.num_action_parents, top_k=1).to(self.device)
+        dist_action_parent_top5 = MulticlassAccuracy(num_classes=self.num_action_parents, top_k=5).to(self.device)
         dist_adverb_parent_top1 = MulticlassAccuracy(num_classes=self.num_adverb_parents, top_k=1).to(self.device)
+        dist_adverb_parent_top5 = MulticlassAccuracy(num_classes=self.num_adverb_parents, top_k=5).to(self.device)
+
+        inner_action_parent_top1 = MulticlassAccuracy(num_classes=self.num_action_parents, top_k=1).to(self.device)
+        inner_action_parent_top5 = MulticlassAccuracy(num_classes=self.num_action_parents, top_k=5).to(self.device)
+        inner_adverb_parent_top1 = MulticlassAccuracy(num_classes=self.num_adverb_parents, top_k=1).to(self.device)
+        inner_adverb_parent_top5 = MulticlassAccuracy(num_classes=self.num_adverb_parents, top_k=5).to(self.device)
+
+        # Compositional accuracy tracker
+        compositional_correct = 0
+        total_samples = 0
+
+        # Hyperbolic geometry metrics
+        entailment_violations_parent_child = []  # Parent → Child violations
+        entailment_violations_child_video = []   # Child → Video violations
+        entailment_violations_parent_video = []  # Parent → Video violations
+        transitivity_violations = []  # Transitivity violations (parent→child & child→video but not parent→video)
+        cone_apertures_action_parent = []
+        cone_apertures_adverb_parent = []
+        depth_action = []
+        depth_adverb = []
+        depth_action_parent = []
+        depth_adverb_parent = []
+        depth_video = []
 
         val_video_norms = []
 
@@ -642,8 +666,10 @@ class Trainer:
                 action_scores_inner = L.pairwise_inner(video_embeds, action_gallery, _curv)
                 adverb_scores_inner = L.pairwise_inner(video_embeds, adverb_gallery, _curv)
 
-                action_parent_scores = -L.pairwise_dist(video_embeds, action_parent_gallery, _curv)
-                adverb_parent_scores = -L.pairwise_dist(video_embeds, adverb_parent_gallery, _curv)
+                action_parent_scores_dist = -L.pairwise_dist(video_embeds, action_parent_gallery, _curv)
+                adverb_parent_scores_dist = -L.pairwise_dist(video_embeds, adverb_parent_gallery, _curv)
+                action_parent_scores_inner = L.pairwise_inner(video_embeds, action_parent_gallery, _curv)
+                adverb_parent_scores_inner = L.pairwise_inner(video_embeds, adverb_parent_gallery, _curv)
 
                 action_labels = torch.LongTensor(
                     [self.model.aa_model.action_2_idx[a.lower()] for a in batch_dict['action']]
@@ -672,11 +698,103 @@ class Trainer:
                 inner_adverb_top1.update(adverb_scores_inner, adverb_labels)
                 inner_adverb_top5.update(adverb_scores_inner, adverb_labels)
 
-                dist_action_parent_top1.update(action_parent_scores, action_parent_labels)
-                dist_adverb_parent_top1.update(adverb_parent_scores, adverb_parent_labels)
+                # Update parent metrics
+                dist_action_parent_top1.update(action_parent_scores_dist, action_parent_labels)
+                dist_action_parent_top5.update(action_parent_scores_dist, action_parent_labels)
+                dist_adverb_parent_top1.update(adverb_parent_scores_dist, adverb_parent_labels)
+                dist_adverb_parent_top5.update(adverb_parent_scores_dist, adverb_parent_labels)
+
+                inner_action_parent_top1.update(action_parent_scores_inner, action_parent_labels)
+                inner_action_parent_top5.update(action_parent_scores_inner, action_parent_labels)
+                inner_adverb_parent_top1.update(adverb_parent_scores_inner, adverb_parent_labels)
+                inner_adverb_parent_top5.update(adverb_parent_scores_inner, adverb_parent_labels)
+
+                # Compositional accuracy (both action AND adverb correct)
+                action_correct = (action_scores_dist.argmax(dim=1) == action_labels)
+                adverb_correct = (adverb_scores_dist.argmax(dim=1) == adverb_labels)
+                compositional_correct += (action_correct & adverb_correct).sum().item()
+                total_samples += video_embeds.size(0)
+
+                # Collect depth distributions (distance from origin)
+                depth_video.append(embedding_norm(video_embeds).cpu())
+                depth_action.append(embedding_norm(outputs['action_embeds_hyp']).cpu())
+                depth_adverb.append(embedding_norm(outputs['adverb_embeds_hyp']).cpu())
+                depth_action_parent.append(embedding_norm(outputs['action_parent_embeds_hyp']).cpu())
+                depth_adverb_parent.append(embedding_norm(outputs['adverb_parent_embeds_hyp']).cpu())
+
+                # Compute cone apertures for parents
+                action_parent_apertures = L.half_aperture(outputs['action_parent_embeds_hyp'], _curv)
+                adverb_parent_apertures = L.half_aperture(outputs['adverb_parent_embeds_hyp'], _curv)
+                cone_apertures_action_parent.append(action_parent_apertures.cpu())
+                cone_apertures_adverb_parent.append(adverb_parent_apertures.cpu())
+
+                # Entailment violations: Check if angle > aperture (cone violation)
+                # Parent → Child
+                action_parent_2_child_angle = L.oxy_angle(
+                    outputs['action_parent_embeds_hyp'],
+                    outputs['action_embeds_hyp'],
+                    _curv
+                )
+                adverb_parent_2_child_angle = L.oxy_angle(
+                    outputs['adverb_parent_embeds_hyp'],
+                    outputs['adverb_embeds_hyp'],
+                    _curv
+                )
+                entailment_violations_parent_child.append(
+                    (action_parent_2_child_angle > action_parent_apertures).float().cpu()
+                )
+                entailment_violations_parent_child.append(
+                    (adverb_parent_2_child_angle > adverb_parent_apertures).float().cpu()
+                )
+
+                # Child → Video
+                action_2_video_angle = L.oxy_angle(outputs['action_embeds_hyp'], video_embeds, _curv)
+                adverb_2_video_angle = L.oxy_angle(outputs['adverb_embeds_hyp'], video_embeds, _curv)
+                action_aperture = L.half_aperture(outputs['action_embeds_hyp'], _curv)
+                adverb_aperture = L.half_aperture(outputs['adverb_embeds_hyp'], _curv)
+                entailment_violations_child_video.append(
+                    (action_2_video_angle > action_aperture).float().cpu()
+                )
+                entailment_violations_child_video.append(
+                    (adverb_2_video_angle > adverb_aperture).float().cpu()
+                )
+
+                # Parent → Video (transitive)
+                action_parent_2_video_angle = L.oxy_angle(
+                    outputs['action_parent_embeds_hyp'],
+                    video_embeds,
+                    _curv
+                )
+                adverb_parent_2_video_angle = L.oxy_angle(
+                    outputs['adverb_parent_embeds_hyp'],
+                    video_embeds,
+                    _curv
+                )
+                entailment_violations_parent_video.append(
+                    (action_parent_2_video_angle > action_parent_apertures).float().cpu()
+                )
+                entailment_violations_parent_video.append(
+                    (adverb_parent_2_video_angle > adverb_parent_apertures).float().cpu()
+                )
+
+                # Transitivity check: if parent→child and child→video, then parent→video should hold
+                # Violation: (parent entails child) AND (child entails video) AND NOT (parent entails video)
+                action_parent_entails_child = (action_parent_2_child_angle <= action_parent_apertures)
+                action_child_entails_video = (action_2_video_angle <= action_aperture)
+                action_parent_entails_video = (action_parent_2_video_angle <= action_parent_apertures)
+                action_transitivity_violations = (action_parent_entails_child & action_child_entails_video & ~action_parent_entails_video).float()
+
+                adverb_parent_entails_child = (adverb_parent_2_child_angle <= adverb_parent_apertures)
+                adverb_child_entails_video = (adverb_2_video_angle <= adverb_aperture)
+                adverb_parent_entails_video = (adverb_parent_2_video_angle <= adverb_parent_apertures)
+                adverb_transitivity_violations = (adverb_parent_entails_child & adverb_child_entails_video & ~adverb_parent_entails_video).float()
+
+                transitivity_violations.append(action_transitivity_violations.cpu())
+                transitivity_violations.append(adverb_transitivity_violations.cpu())
 
         avg_val_loss = val_loss_meter.avg
 
+        # Child accuracies
         d_act1 = dist_action_top1.compute().item()
         d_act5 = dist_action_top5.compute().item()
         d_adv1 = dist_adverb_top1.compute().item()
@@ -687,15 +805,59 @@ class Trainer:
         i_adv1 = inner_adverb_top1.compute().item()
         i_adv5 = inner_adverb_top5.compute().item()
 
+        # Parent accuracies
         d_act_parent1 = dist_action_parent_top1.compute().item()
+        d_act_parent5 = dist_action_parent_top5.compute().item()
         d_adv_parent1 = dist_adverb_parent_top1.compute().item()
+        d_adv_parent5 = dist_adverb_parent_top5.compute().item()
+
+        i_act_parent1 = inner_action_parent_top1.compute().item()
+        i_act_parent5 = inner_action_parent_top5.compute().item()
+        i_adv_parent1 = inner_adverb_parent_top1.compute().item()
+        i_adv_parent5 = inner_adverb_parent_top5.compute().item()
+
+        # Compositional accuracy
+        compositional_acc = compositional_correct / total_samples if total_samples > 0 else 0.0
+
+        # Compute hyperbolic geometry metrics
+        all_entailment_violations_pc = torch.cat(entailment_violations_parent_child).numpy()
+        all_entailment_violations_cv = torch.cat(entailment_violations_child_video).numpy()
+        all_entailment_violations_pv = torch.cat(entailment_violations_parent_video).numpy()
+        all_transitivity_violations = torch.cat(transitivity_violations).numpy()
+
+        violation_rate_parent_child = all_entailment_violations_pc.mean()
+        violation_rate_child_video = all_entailment_violations_cv.mean()
+        violation_rate_parent_video = all_entailment_violations_pv.mean()
+        transitivity_violation_rate = all_transitivity_violations.mean()
+
+        all_cone_apertures_action = torch.cat(cone_apertures_action_parent).numpy()
+        all_cone_apertures_adverb = torch.cat(cone_apertures_adverb_parent).numpy()
+        avg_cone_aperture_action = all_cone_apertures_action.mean()
+        avg_cone_aperture_adverb = all_cone_apertures_adverb.mean()
+
+        all_depth_video = torch.cat(depth_video).numpy()
+        all_depth_action = torch.cat(depth_action).numpy()
+        all_depth_adverb = torch.cat(depth_adverb).numpy()
+        all_depth_action_parent = torch.cat(depth_action_parent).numpy()
+        all_depth_adverb_parent = torch.cat(depth_adverb_parent).numpy()
 
         self.val_losses.append(avg_val_loss)
 
         print('E %d | Val Loss: %.4f' % (self.current_epoch, avg_val_loss))
         print('  [dist]  Action Top-1: %.4f Top-5: %.4f | Adverb Top-1: %.4f Top-5: %.4f' % (d_act1, d_act5, d_adv1, d_adv5))
         print('  [inner] Action Top-1: %.4f Top-5: %.4f | Adverb Top-1: %.4f Top-5: %.4f' % (i_act1, i_act5, i_adv1, i_adv5))
-        print('  [parent] Action Parent Top-1: %.4f | Adverb Parent Top-1: %.4f' % (d_act_parent1, d_adv_parent1))
+        print('  [parent-dist] Action Top-1: %.4f Top-5: %.4f | Adverb Top-1: %.4f Top-5: %.4f' % (d_act_parent1, d_act_parent5, d_adv_parent1, d_adv_parent5))
+        print('  [parent-inner] Action Top-1: %.4f Top-5: %.4f | Adverb Top-1: %.4f Top-5: %.4f' % (i_act_parent1, i_act_parent5, i_adv_parent1, i_adv_parent5))
+        print('  [compositional] Both Action+Adverb Correct: %.4f' % compositional_acc)
+        print('  [entailment violations] Parent→Child: %.4f | Child→Video: %.4f | Parent→Video: %.4f | Transitivity: %.4f' %
+              (violation_rate_parent_child, violation_rate_child_video, violation_rate_parent_video, transitivity_violation_rate))
+        print('  [cone apertures] Action Parent: %.4f | Adverb Parent: %.4f' % (avg_cone_aperture_action, avg_cone_aperture_adverb))
+        print('  [depth] Video: %.4f±%.4f | Action: %.4f±%.4f | Adverb: %.4f±%.4f' %
+              (all_depth_video.mean(), all_depth_video.std(), all_depth_action.mean(), all_depth_action.std(),
+               all_depth_adverb.mean(), all_depth_adverb.std()))
+        print('  [depth] Action Parent: %.4f±%.4f | Adverb Parent: %.4f±%.4f' %
+              (all_depth_action_parent.mean(), all_depth_action_parent.std(),
+               all_depth_adverb_parent.mean(), all_depth_adverb_parent.std()))
 
         if self.wandb_enabled:
             wandb.log({
@@ -703,22 +865,75 @@ class Trainer:
                 'val/loss_total': avg_val_loss,
                 'val/loss_contrastive': val_contrastive_loss_meter.avg,
                 'val/loss_entail': val_entail_loss_meter.avg,
+
+                # Child metrics (dist)
                 'val/dist_action_top1': d_act1,
                 'val/dist_action_top5': d_act5,
                 'val/dist_adverb_top1': d_adv1,
                 'val/dist_adverb_top5': d_adv5,
                 'val/dist_combined_top1': (d_act1 + d_adv1) / 2,
+
+                # Child metrics (inner)
                 'val/inner_action_top1': i_act1,
                 'val/inner_action_top5': i_act5,
                 'val/inner_adverb_top1': i_adv1,
                 'val/inner_adverb_top5': i_adv5,
                 'val/inner_combined_top1': (i_act1 + i_adv1) / 2,
+
+                # Parent metrics (dist)
                 'val/dist_action_parent_top1': d_act_parent1,
+                'val/dist_action_parent_top5': d_act_parent5,
                 'val/dist_adverb_parent_top1': d_adv_parent1,
+                'val/dist_adverb_parent_top5': d_adv_parent5,
                 'val/dist_parent_combined_top1': (d_act_parent1 + d_adv_parent1) / 2,
+                'val/dist_parent_combined_top5': (d_act_parent5 + d_adv_parent5) / 2,
+
+                # Parent metrics (inner)
+                'val/inner_action_parent_top1': i_act_parent1,
+                'val/inner_action_parent_top5': i_act_parent5,
+                'val/inner_adverb_parent_top1': i_adv_parent1,
+                'val/inner_adverb_parent_top5': i_adv_parent5,
+                'val/inner_parent_combined_top1': (i_act_parent1 + i_adv_parent1) / 2,
+                'val/inner_parent_combined_top5': (i_act_parent5 + i_adv_parent5) / 2,
+
+                # Compositional accuracy
+                'val/compositional_accuracy': compositional_acc,
+
+                # Entailment violations
+                'val/entailment_violation_parent_to_child': violation_rate_parent_child,
+                'val/entailment_violation_child_to_video': violation_rate_child_video,
+                'val/entailment_violation_parent_to_video': violation_rate_parent_video,
+                'val/transitivity_violation_rate': transitivity_violation_rate,
+
+                # Cone apertures
+                'val/cone_aperture_action_parent_mean': avg_cone_aperture_action,
+                'val/cone_aperture_adverb_parent_mean': avg_cone_aperture_adverb,
+                'val/cone_aperture_action_parent': wandb.Histogram(all_cone_apertures_action),
+                'val/cone_aperture_adverb_parent': wandb.Histogram(all_cone_apertures_adverb),
+
+                # Depth distributions
+                'val/depth_video_mean': all_depth_video.mean(),
+                'val/depth_video_std': all_depth_video.std(),
+                'val/depth_action_mean': all_depth_action.mean(),
+                'val/depth_action_std': all_depth_action.std(),
+                'val/depth_adverb_mean': all_depth_adverb.mean(),
+                'val/depth_adverb_std': all_depth_adverb.std(),
+                'val/depth_action_parent_mean': all_depth_action_parent.mean(),
+                'val/depth_action_parent_std': all_depth_action_parent.std(),
+                'val/depth_adverb_parent_mean': all_depth_adverb_parent.mean(),
+                'val/depth_adverb_parent_std': all_depth_adverb_parent.std(),
+
+                # Embedding norm histograms
                 'val/norm_action_vocab': wandb.Histogram(embedding_norm(action_gallery).cpu().numpy()),
                 'val/norm_adverb_vocab': wandb.Histogram(embedding_norm(adverb_gallery).cpu().numpy()),
+                'val/norm_action_parent_vocab': wandb.Histogram(embedding_norm(action_parent_gallery).cpu().numpy()),
+                'val/norm_adverb_parent_vocab': wandb.Histogram(embedding_norm(adverb_parent_gallery).cpu().numpy()),
                 'val/norm_video': wandb.Histogram(torch.cat(val_video_norms).numpy()),
+                'val/norm_depth_video': wandb.Histogram(all_depth_video),
+                'val/norm_depth_action': wandb.Histogram(all_depth_action),
+                'val/norm_depth_adverb': wandb.Histogram(all_depth_adverb),
+                'val/norm_depth_action_parent': wandb.Histogram(all_depth_action_parent),
+                'val/norm_depth_adverb_parent': wandb.Histogram(all_depth_adverb_parent),
             })
 
         if d_act1 > self.best_action_acc:
