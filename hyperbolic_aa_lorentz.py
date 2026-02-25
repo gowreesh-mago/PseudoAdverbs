@@ -321,6 +321,7 @@ class Trainer:
         self.best_val_loss = float('inf')
         self.best_action_acc = 0.0
         self.best_adverb_acc = 0.0
+        self.best_compositional_acc = 0.0
 
         if self.wandb_enabled:
             wandb.watch(model, log='all', log_freq=100, log_graph=True)
@@ -479,6 +480,10 @@ class Trainer:
         inner_adverb_top1 = MulticlassAccuracy(num_classes=self.num_adverbs, top_k=1).to(self.device)
         inner_adverb_top5 = MulticlassAccuracy(num_classes=self.num_adverbs, top_k=5).to(self.device)
 
+        # Compositional accuracy tracker
+        compositional_correct = 0
+        total_samples = 0
+
         val_video_norms = []
 
         with torch.no_grad():
@@ -521,6 +526,12 @@ class Trainer:
                 inner_adverb_top1.update(adverb_scores_inner, adverb_labels)
                 inner_adverb_top5.update(adverb_scores_inner, adverb_labels)
 
+                # Compositional accuracy (both action AND adverb correct)
+                action_correct = (action_scores_dist.argmax(dim=1) == action_labels)
+                adverb_correct = (adverb_scores_dist.argmax(dim=1) == adverb_labels)
+                compositional_correct += (action_correct & adverb_correct).sum().item()
+                total_samples += video_embeds.size(0)
+
         avg_val_loss = val_loss_meter.avg
 
         d_act1 = dist_action_top1.compute().item()
@@ -533,11 +544,15 @@ class Trainer:
         i_adv1 = inner_adverb_top1.compute().item()
         i_adv5 = inner_adverb_top5.compute().item()
 
+        # Compositional accuracy
+        compositional_acc = compositional_correct / total_samples if total_samples > 0 else 0.0
+
         self.val_losses.append(avg_val_loss)
 
         print('E %d | Val Loss: %.4f' % (self.current_epoch, avg_val_loss))
         print('  [dist]  Action Top-1: %.4f Top-5: %.4f | Adverb Top-1: %.4f Top-5: %.4f' % (d_act1, d_act5, d_adv1, d_adv5))
         print('  [inner] Action Top-1: %.4f Top-5: %.4f | Adverb Top-1: %.4f Top-5: %.4f' % (i_act1, i_act5, i_adv1, i_adv5))
+        print('  [compositional] Both Action+Adverb Correct: %.4f' % compositional_acc)
 
         if self.wandb_enabled:
             wandb.log({
@@ -555,6 +570,7 @@ class Trainer:
                 'val/inner_adverb_top1': i_adv1,
                 'val/inner_adverb_top5': i_adv5,
                 'val/inner_combined_top1': (i_act1 + i_adv1) / 2,
+                'val/compositional_accuracy': compositional_acc,
                 'val/norm_action_vocab': wandb.Histogram(embedding_norm(action_gallery).cpu().numpy()),
                 'val/norm_adverb_vocab': wandb.Histogram(embedding_norm(adverb_gallery).cpu().numpy()),
                 'val/norm_video': wandb.Histogram(torch.cat(val_video_norms).numpy()),
@@ -564,6 +580,8 @@ class Trainer:
             self.best_action_acc = d_act1
         if d_adv1 > self.best_adverb_acc:
             self.best_adverb_acc = d_adv1
+        if compositional_acc > self.best_compositional_acc:
+            self.best_compositional_acc = compositional_acc
 
         return avg_val_loss
 
@@ -586,6 +604,7 @@ class Trainer:
             print(f'  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}')
             print(f'  Best Val Loss: {self.best_val_loss:.4f}')
             print(f'  Best Action Acc: {self.best_action_acc:.4f} | Best Adverb Acc: {self.best_adverb_acc:.4f}')
+            print(f'  Best Compositional Acc: {self.best_compositional_acc:.4f}')
             print(f'  Epoch Time: {epoch_time:.2f}s')
             print(f'{"="*80}\n')
 
@@ -599,6 +618,7 @@ class Trainer:
                     wandb.run.summary['best_epoch'] = epoch
                     wandb.run.summary['best_action_acc'] = self.best_action_acc
                     wandb.run.summary['best_adverb_acc'] = self.best_adverb_acc
+                    wandb.run.summary['best_compositional_acc'] = self.best_compositional_acc
 
             if self.save_checkpoints and (epoch + 1) % self.config.get('save_freq', 100) == 0:
                 self.save_checkpoint(f'checkpoint_epoch_{epoch+1}.pth')
@@ -615,6 +635,7 @@ class Trainer:
         print(f'  Best Val Loss: {self.best_val_loss:.4f}')
         print(f'  Best Action Acc: {self.best_action_acc:.4f}')
         print(f'  Best Adverb Acc: {self.best_adverb_acc:.4f}')
+        print(f'  Best Compositional Acc: {self.best_compositional_acc:.4f}')
         print(f'{"="*80}\n')
 
         if self.wandb_enabled:
@@ -632,6 +653,7 @@ class Trainer:
             'best_val_loss': self.best_val_loss,
             'best_action_acc': self.best_action_acc,
             'best_adverb_acc': self.best_adverb_acc,
+            'best_compositional_acc': self.best_compositional_acc,
             'config': self.config
         }
         checkpoint_path = os.path.join(self.output_dir, filename)
@@ -643,12 +665,14 @@ class Trainer:
                 name=f'model-{wandb.run.id}',
                 type='model',
                 description=f'Best model at epoch {self.current_epoch} with val_loss={self.best_val_loss:.4f}, '
-                            f'action_acc={self.best_action_acc:.4f}, adverb_acc={self.best_adverb_acc:.4f}',
+                            f'action_acc={self.best_action_acc:.4f}, adverb_acc={self.best_adverb_acc:.4f}, '
+                            f'compositional_acc={self.best_compositional_acc:.4f}',
                 metadata={
                     'epoch': self.current_epoch,
                     'val_loss': self.best_val_loss,
                     'action_acc': self.best_action_acc,
                     'adverb_acc': self.best_adverb_acc,
+                    'compositional_acc': self.best_compositional_acc,
                 }
             )
             artifact.add_file(checkpoint_path)
@@ -666,10 +690,12 @@ class Trainer:
         self.best_val_loss = checkpoint['best_val_loss']
         self.best_action_acc = checkpoint.get('best_action_acc', 0.0)
         self.best_adverb_acc = checkpoint.get('best_adverb_acc', 0.0)
+        self.best_compositional_acc = checkpoint.get('best_compositional_acc', 0.0)
         print(f'Loaded checkpoint from epoch {checkpoint["epoch"]}')
         print(f'  Best Val Loss: {self.best_val_loss:.4f}')
         print(f'  Best Action Acc: {self.best_action_acc:.4f}')
         print(f'  Best Adverb Acc: {self.best_adverb_acc:.4f}')
+        print(f'  Best Compositional Acc: {self.best_compositional_acc:.4f}')
 
 
 def main():
