@@ -64,3 +64,27 @@ parser.add_argument('--class-mode', type=str, choices=['present_only', 'all_clas
 parser.add_argument('--manifold', type=str, default='euclidean', choices=['euclidean', 'hyperbolic'],
                     help='Manifold type for embeddings (for compatibility, not used in classification)')
 parser.add_argument('--num-layers', type=int, default=2, help='Number of layers in the classifier')
+
+# Transformer architecture arguments
+parser.add_argument('--d-model', type=int, default=512,
+                    help='Dimension of transformer model')
+parser.add_argument('--num-transformer-layers', type=int, default=4,
+                    help='Number of transformer encoder layers')
+parser.add_argument('--transformer-nhead', type=int, default=8,
+                    help='Number of attention heads in transformer')
+parser.add_argument('--transformer-dim-feedforward', type=int, default=2048,
+                    help='Dimension of feedforward network in transformer')
+parser.add_argument('--transformer-dropout', type=float, default=0.1,
+                    help='Dropout rate in transformer')
+
+# Loss weighting for dual transformer
+parser.add_argument('--action-weight', type=float, default=1.0,
+                    help='Weight for action loss in combined loss')
+parser.add_argument('--adverb-weight', type=float, default=1.0,
+                    help='Weight for adverb loss in combined loss')
+
+# Architecture options for dual transformer
+parser.add_argument('--shared-input-projection', action='store_true', default=False,
+                    help='Share input projection between action and adverb branches')
+parser.add_argument('--shared-pos-encoding', action='store_true', default=False,
+                    help='Share positional encoding between action and adverb branches')
