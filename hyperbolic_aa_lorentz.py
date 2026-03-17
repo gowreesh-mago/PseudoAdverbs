@@ -14,11 +14,158 @@ from tqdm import tqdm
 import time
 from torchmetrics.classification import MulticlassAccuracy
 import argparse
+import random
+
+
+def set_seed(seed: int):
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def embedding_norm(x: torch.Tensor) -> torch.Tensor:
     """L2 norm of embedding vectors. Shape: (B, D) -> (B,)"""
     return torch.norm(x, dim=-1)
+
+
+def check_tensor_health(tensor, name, location="", batch_idx=None, epoch=None,
+                       debug=False, raise_on_nan=False, config=None):
+    """
+    Comprehensive tensor health check with detailed logging.
+
+    Args:
+        tensor: Tensor to check
+        name: Descriptive name for logging
+        location: Code location/context (e.g., "AAModel.forward() line 167")
+        batch_idx: Optional batch index for context
+        epoch: Optional epoch number for context
+        debug: If True, always print stats. If False, only print on NaN/Inf
+        raise_on_nan: If True, raise exception on NaN/Inf detection
+        config: Optional config dict for accessing output_dir
+
+    Returns:
+        True if tensor is healthy (no NaN/Inf), False otherwise
+    """
+    if tensor is None:
+        print(f"⚠️  WARNING: Tensor '{name}' is None at {location}")
+        return False
+
+    # Check for NaN and Inf
+    has_nan = torch.isnan(tensor).any().item()
+    has_inf = torch.isinf(tensor).any().item()
+    is_healthy = not (has_nan or has_inf)
+
+    # Only print if debug=True or if unhealthy
+    if debug or not is_healthy:
+        print(f"\n{'='*70}")
+        if not is_healthy:
+            print(f"🚨 NaN/Inf DETECTED: {name}")
+        else:
+            print(f"✓ TENSOR CHECK: {name}")
+
+        if location:
+            print(f"Location: {location}")
+        if batch_idx is not None:
+            print(f"Batch: {batch_idx}", end="")
+            if epoch is not None:
+                print(f", Epoch: {epoch}")
+            else:
+                print()
+
+        print(f"\nTENSOR HEALTH: {name}")
+        print(f"  Shape: {tensor.shape}")
+        print(f"  dtype: {tensor.dtype}, device: {tensor.device}")
+
+        if has_nan:
+            nan_count = torch.isnan(tensor).sum().item()
+            total_elements = tensor.numel()
+            print(f"  ❌ HAS NaN: True ({nan_count}/{total_elements} elements)")
+        else:
+            print(f"  ✓ No NaN")
+
+        if has_inf:
+            inf_count = torch.isinf(tensor).sum().item()
+            total_elements = tensor.numel()
+            print(f"  ❌ HAS Inf: True ({inf_count}/{total_elements} elements)")
+        else:
+            print(f"  ✓ No Inf")
+
+        # Compute statistics (handle NaN gracefully)
+        try:
+            if not has_nan:
+                tensor_min = tensor.min().item()
+                tensor_max = tensor.max().item()
+                tensor_mean = tensor.mean().item()
+                tensor_std = tensor.std().item()
+                tensor_norm = torch.norm(tensor).item()
+
+                print(f"  Stats: min={tensor_min:.6f}, max={tensor_max:.6f}, "
+                      f"mean={tensor_mean:.6f}, std={tensor_std:.6f}")
+                print(f"  Norm (L2): {tensor_norm:.6f}")
+            else:
+                # Try to compute stats excluding NaN
+                mask = ~torch.isnan(tensor)
+                if mask.any():
+                    valid_tensor = tensor[mask]
+                    tensor_min = valid_tensor.min().item()
+                    tensor_max = valid_tensor.max().item()
+                    tensor_mean = valid_tensor.mean().item()
+                    tensor_std = valid_tensor.std().item()
+                    print(f"  Stats (excluding NaN): min={tensor_min:.6f}, max={tensor_max:.6f}, "
+                          f"mean={tensor_mean:.6f}, std={tensor_std:.6f}")
+                    print(f"  Norm (L2): nan")
+                else:
+                    print(f"  Stats: All values are NaN")
+        except Exception as e:
+            print(f"  Could not compute stats: {e}")
+
+        print(f"{'='*70}\n")
+
+    # Save diagnostic info to file if NaN/Inf detected
+    if not is_healthy and config is not None:
+        try:
+            output_dir = config.get('output_dir', 'checkpoints')
+            run_name = config.get('run_name', 'default_run')
+            diag_dir = os.path.join(output_dir, run_name)
+            os.makedirs(diag_dir, exist_ok=True)
+
+            diag_file = os.path.join(diag_dir,
+                f"nan_diagnostic_epoch{epoch}_batch{batch_idx}_{name.replace(' ', '_')}.txt")
+
+            with open(diag_file, 'w') as f:
+                f.write(f"NaN/Inf Diagnostic Report\n")
+                f.write(f"{'='*70}\n\n")
+                f.write(f"Tensor: {name}\n")
+                f.write(f"Location: {location}\n")
+                f.write(f"Batch: {batch_idx}, Epoch: {epoch}\n\n")
+                f.write(f"Shape: {tensor.shape}\n")
+                f.write(f"dtype: {tensor.dtype}, device: {tensor.device}\n")
+                f.write(f"Has NaN: {has_nan}\n")
+                f.write(f"Has Inf: {has_inf}\n\n")
+
+                if has_nan:
+                    nan_count = torch.isnan(tensor).sum().item()
+                    f.write(f"NaN count: {nan_count}/{tensor.numel()}\n")
+                if has_inf:
+                    inf_count = torch.isinf(tensor).sum().item()
+                    f.write(f"Inf count: {inf_count}/{tensor.numel()}\n")
+
+                f.write(f"\nTensor data (first 100 elements):\n")
+                f.write(str(tensor.flatten()[:100].cpu().detach().numpy()))
+
+            print(f"📝 Diagnostic info saved to: {diag_file}")
+        except Exception as e:
+            print(f"⚠️  Could not save diagnostic file: {e}")
+
+    if raise_on_nan and not is_healthy:
+        raise ValueError(f"NaN or Inf detected in tensor '{name}' at {location}")
+
+    return is_healthy
 
 
 def collate_fn(batch):
@@ -164,8 +311,28 @@ class AAModel(nn.Module):
     def forward(self, batch):
         flow = batch['flow_features'].to(self.config['device'])
         rgb = batch['rgb_features'].to(self.config['device'])
+
+        # Check 1: Concatenated input features
+        video_input = torch.cat((flow, rgb), dim=-1)
+        debug = self.config.get('debug', False)
+        if self.config.get('nan_check', True):
+            check_tensor_health(video_input, "video_input (flow+rgb)",
+                              "AAModel.forward() after concat", debug=debug, config=self.config)
+
+        # Check 2: Video encoder output
         video_features = self.get_video_features(flow, rgb)
+        if self.config.get('nan_check', True):
+            check_tensor_health(video_features, "video_features",
+                              "AAModel.forward() after video_encoder", debug=debug, config=self.config)
+
+        # Check 3 & 4: Action and adverb embeddings
         action_embeds, adverb_embeds = self.get_text_features(batch['action'], batch['adverb'])
+        if self.config.get('nan_check', True):
+            check_tensor_health(action_embeds, "action_embeds",
+                              "AAModel.forward() after get_action_embeddings", debug=debug, config=self.config)
+            check_tensor_health(adverb_embeds, "adverb_embeds",
+                              "AAModel.forward() after get_adverb_embeddings", debug=debug, config=self.config)
+
         return {
             'video_features': video_features,
             'action_embeds': action_embeds,
@@ -184,6 +351,7 @@ class ProjectionModule(nn.Module):
         self.entail_weight = entail_weight
         self.alpha = nn.Parameter(torch.tensor(config.get('output_dim', 512) ** -0.5).log())
         self.logit_scale = nn.Parameter(torch.tensor(1 / 0.07).log())
+        self.config = config  # Store config for NaN checking
 
     def entailment_loss(self, parent_embeds, child_embeds):
         _angle = L.oxy_angle(parent_embeds, child_embeds, self.curv.exp())
@@ -191,41 +359,149 @@ class ProjectionModule(nn.Module):
         return self.entail_weight * torch.clamp(_angle - _aperture, min=0).mean()
 
     def project(self, features):
-        features = features * self.alpha.exp()
-        return L.exp_map0(features, self.curv.exp())
+        debug = self.config.get('debug', False) if self.config else False
+        nan_check = self.config.get('nan_check', True) if self.config else True
+
+        # Check 1: Input features before scaling
+        if nan_check:
+            check_tensor_health(features, "features (before alpha scaling)",
+                              "ProjectionModule.project() line 314", debug=debug, config=self.config)
+
+        # Log parameters
+        if debug or nan_check:
+            alpha_raw = self.alpha.item()
+            alpha_exp = self.alpha.exp().item()
+            if debug:
+                print(f"  [ProjectionModule.project] alpha (raw): {alpha_raw:.6f}, alpha.exp(): {alpha_exp:.6f}")
+
+        # Check 2: After alpha scaling - CRITICAL checkpoint
+        features_scaled = features * self.alpha.exp()
+        if nan_check:
+            check_tensor_health(features_scaled, "features_scaled (after alpha)",
+                              "ProjectionModule.project() line 315 (CRITICAL)", debug=debug, config=self.config)
+
+        # Check 3: After hyperbolic projection
+        features_hyp = L.exp_map0(features_scaled, self.curv.exp())
+        if nan_check:
+            check_tensor_health(features_hyp, "features_hyperbolic",
+                              "ProjectionModule.project() after exp_map0", debug=debug, config=self.config)
+
+        return features_hyp
 
     def forward(self, batch):
+        debug = self.config.get('debug', False) if self.config else False
+        nan_check = self.config.get('nan_check', True) if self.config else True
+
+        # Check 1: Log parameters at start
         self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
         _curv = self.curv.exp()
+        self.logit_scale.data = torch.clamp(self.logit_scale.data, max=math.log(100))
+        _scale = self.logit_scale.exp()
 
+        if debug:
+            print(f"\n[ProjectionModule.forward] PARAMETERS:")
+            print(f"  curv (raw): {self.curv.item():.6f} (clamped to [{self._curv_minmax['min']:.3f}, {self._curv_minmax['max']:.3f}])")
+            print(f"  curv (exp): {_curv.item():.6f}")
+            print(f"  alpha (raw): {self.alpha.item():.6f}")
+            print(f"  alpha (exp): {self.alpha.exp().item():.6f}")
+            print(f"  logit_scale (raw): {self.logit_scale.item():.6f} (clamped to max={math.log(100):.3f})")
+            print(f"  logit_scale (exp): {_scale.item():.6f}")
+
+        # Check 2: After each projection call
         action_embeds_hyp = self.project(batch['action_embeds'])
-        adverb_embeds_hyp = self.project(batch['adverb_embeds'])
-        video_embeds_hyp = self.project(batch['video_features'])
+        if nan_check:
+            check_tensor_health(action_embeds_hyp, "action_embeds_hyp",
+                              "ProjectionModule.forward() after project(action)", debug=debug, config=self.config)
 
+        adverb_embeds_hyp = self.project(batch['adverb_embeds'])
+        if nan_check:
+            check_tensor_health(adverb_embeds_hyp, "adverb_embeds_hyp",
+                              "ProjectionModule.forward() after project(adverb)", debug=debug, config=self.config)
+
+        video_embeds_hyp = self.project(batch['video_features'])
+        if nan_check:
+            check_tensor_health(video_embeds_hyp, "video_embeds_hyp",
+                              "ProjectionModule.forward() after project(video)", debug=debug, config=self.config)
+
+        # Check 3: After pairwise distance calculations
         video_2_adverb_logits = -L.pairwise_dist(video_embeds_hyp, adverb_embeds_hyp, _curv)
+        if nan_check:
+            check_tensor_health(video_2_adverb_logits, "video_2_adverb_logits",
+                              "ProjectionModule.forward() after pairwise_dist", debug=debug, config=self.config)
+
         adverb_2_video_logits = -L.pairwise_dist(adverb_embeds_hyp, video_embeds_hyp, _curv)
+        if nan_check:
+            check_tensor_health(adverb_2_video_logits, "adverb_2_video_logits",
+                              "ProjectionModule.forward() after pairwise_dist", debug=debug, config=self.config)
+
         video_2_action_logits = -L.pairwise_dist(video_embeds_hyp, action_embeds_hyp, _curv)
+        if nan_check:
+            check_tensor_health(video_2_action_logits, "video_2_action_logits",
+                              "ProjectionModule.forward() after pairwise_dist", debug=debug, config=self.config)
+
         action_2_video_logits = -L.pairwise_dist(action_embeds_hyp, video_embeds_hyp, _curv)
+        if nan_check:
+            check_tensor_health(action_2_video_logits, "action_2_video_logits",
+                              "ProjectionModule.forward() after pairwise_dist", debug=debug, config=self.config)
 
         batch_size = video_embeds_hyp.size(0)
         labels = torch.arange(batch_size).to(video_embeds_hyp.device)
 
-        self.logit_scale.data = torch.clamp(self.logit_scale.data, max=math.log(100))
-        _scale = self.logit_scale.exp()
+        # Check 4: Scaled logits before cross_entropy
+        if debug:
+            v2adv_scaled = video_2_adverb_logits * _scale
+            print(f"\n[Scaled Logits Check]")
+            print(f"  video_2_adverb * scale: min={v2adv_scaled.min().item():.2f}, max={v2adv_scaled.max().item():.2f}")
+            if (v2adv_scaled.abs() > 100).any():
+                print(f"  ⚠️  WARNING: Some scaled logits exceed ±100!")
 
-        contrastive_loss = (
-            nn.functional.cross_entropy(video_2_adverb_logits * _scale, labels) +
-            nn.functional.cross_entropy(adverb_2_video_logits * _scale, labels) +
-            nn.functional.cross_entropy(video_2_action_logits * _scale, labels) +
-            nn.functional.cross_entropy(action_2_video_logits * _scale, labels)
-        ) / 4
+        # Check 5: Individual loss components
+        ce_v2adv = nn.functional.cross_entropy(video_2_adverb_logits * _scale, labels)
+        if nan_check:
+            check_tensor_health(ce_v2adv.unsqueeze(0), "cross_entropy(v2adv)",
+                              "ProjectionModule.forward() CE loss 1", debug=debug, config=self.config)
 
-        entailment_loss = (
-            self.entailment_loss(action_embeds_hyp, video_embeds_hyp) +
-            self.entailment_loss(adverb_embeds_hyp, video_embeds_hyp)
-        )
+        ce_adv2v = nn.functional.cross_entropy(adverb_2_video_logits * _scale, labels)
+        if nan_check:
+            check_tensor_health(ce_adv2v.unsqueeze(0), "cross_entropy(adv2v)",
+                              "ProjectionModule.forward() CE loss 2", debug=debug, config=self.config)
+
+        ce_v2act = nn.functional.cross_entropy(video_2_action_logits * _scale, labels)
+        if nan_check:
+            check_tensor_health(ce_v2act.unsqueeze(0), "cross_entropy(v2act)",
+                              "ProjectionModule.forward() CE loss 3", debug=debug, config=self.config)
+
+        ce_act2v = nn.functional.cross_entropy(action_2_video_logits * _scale, labels)
+        if nan_check:
+            check_tensor_health(ce_act2v.unsqueeze(0), "cross_entropy(act2v)",
+                              "ProjectionModule.forward() CE loss 4", debug=debug, config=self.config)
+
+        contrastive_loss = (ce_v2adv + ce_adv2v + ce_v2act + ce_act2v) / 4
+        if nan_check:
+            check_tensor_health(contrastive_loss.unsqueeze(0), "contrastive_loss",
+                              "ProjectionModule.forward() contrastive loss", debug=debug, config=self.config)
+
+        # Entailment loss components
+        ent_loss_action = self.entailment_loss(action_embeds_hyp, video_embeds_hyp)
+        if nan_check:
+            check_tensor_health(ent_loss_action.unsqueeze(0), "entailment_loss(action)",
+                              "ProjectionModule.forward() entailment 1", debug=debug, config=self.config)
+
+        ent_loss_adverb = self.entailment_loss(adverb_embeds_hyp, video_embeds_hyp)
+        if nan_check:
+            check_tensor_health(ent_loss_adverb.unsqueeze(0), "entailment_loss(adverb)",
+                              "ProjectionModule.forward() entailment 2", debug=debug, config=self.config)
+
+        entailment_loss = ent_loss_action + ent_loss_adverb
+        if nan_check:
+            check_tensor_health(entailment_loss.unsqueeze(0), "entailment_loss_total",
+                              "ProjectionModule.forward() entailment total", debug=debug, config=self.config)
 
         loss = contrastive_loss + entailment_loss
+        if nan_check:
+            check_tensor_health(loss.unsqueeze(0), "total_loss",
+                              "ProjectionModule.forward() FINAL LOSS", debug=debug, config=self.config)
+
         return {
             "loss": loss,
             'action_embeds_hyp': action_embeds_hyp,
@@ -364,6 +640,58 @@ class Trainer:
             _scale = outputs['logging']['logit_scale']
             _curv = outputs['logging']['curv']
 
+            # Check 1: Model outputs and embeddings
+            debug = self.config.get('debug', False)
+            nan_check = self.config.get('nan_check', True)
+
+            if nan_check:
+                # Check embeddings
+                healthy = check_tensor_health(outputs['video_embeds_hyp'], "video_embeds_hyp",
+                                            f"Trainer.train_one_epoch() batch {batch_idx}",
+                                            batch_idx=batch_idx, epoch=self.current_epoch,
+                                            debug=debug, config=self.config)
+                if not healthy:
+                    print(f"\n🚨 NaN DETECTED IN FORWARD PASS!")
+                    print(f"Batch details: {batch_idx}, Epoch: {self.current_epoch}")
+                    print(f"Clip IDs: {batch_dict['clip_id'][:5]}...")  # Show first 5
+                    print(f"Actions: {batch_dict['action'][:5]}...")
+                    print(f"Adverbs: {batch_dict['adverb'][:5]}...")
+                    print(f"\n❌ Training terminated due to NaN in forward pass.")
+                    return float('nan')
+
+                check_tensor_health(outputs['action_embeds_hyp'], "action_embeds_hyp",
+                                  f"Trainer.train_one_epoch() batch {batch_idx}",
+                                  batch_idx=batch_idx, epoch=self.current_epoch,
+                                  debug=debug, config=self.config)
+                check_tensor_health(outputs['adverb_embeds_hyp'], "adverb_embeds_hyp",
+                                  f"Trainer.train_one_epoch() batch {batch_idx}",
+                                  batch_idx=batch_idx, epoch=self.current_epoch,
+                                  debug=debug, config=self.config)
+
+            # Check 2: Loss values
+            if nan_check:
+                healthy = check_tensor_health(loss.unsqueeze(0), "loss",
+                                            f"Trainer.train_one_epoch() batch {batch_idx}",
+                                            batch_idx=batch_idx, epoch=self.current_epoch,
+                                            debug=debug, config=self.config)
+                if not healthy:
+                    print(f"\n🚨 NaN DETECTED IN LOSS!")
+                    print(f"  Contrastive loss: {loss_contrastive.item()}")
+                    print(f"  Entailment loss: {loss_entail.item()}")
+                    print(f"  Logit scale: {_scale.item()}")
+                    print(f"  Curvature: {_curv.item()}")
+                    print(f"\n❌ Training terminated due to NaN in loss.")
+                    return float('nan')
+
+                check_tensor_health(loss_contrastive.unsqueeze(0), "loss_contrastive",
+                                  f"Trainer.train_one_epoch() batch {batch_idx}",
+                                  batch_idx=batch_idx, epoch=self.current_epoch,
+                                  debug=debug, config=self.config)
+                check_tensor_health(loss_entail.unsqueeze(0), "loss_entail",
+                                  f"Trainer.train_one_epoch() batch {batch_idx}",
+                                  batch_idx=batch_idx, epoch=self.current_epoch,
+                                  debug=debug, config=self.config)
+
             if self.config.get('debug', False):
                 print(f"  Losses:")
                 print(f"    Total: {loss.item():.4f}")
@@ -374,6 +702,40 @@ class Trainer:
 
             self.optimizer.zero_grad()
             loss.backward()
+
+            # Check 3: Gradients after backward pass
+            if nan_check:
+                grad_check_failed = False
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                            print(f"\n🚨 NaN/Inf DETECTED IN GRADIENT: {name}")
+                            print(f"  Batch: {batch_idx}, Epoch: {self.current_epoch}")
+                            print(f"  Gradient shape: {param.grad.shape}")
+                            print(f"  Has NaN: {torch.isnan(param.grad).any().item()}")
+                            print(f"  Has Inf: {torch.isinf(param.grad).any().item()}")
+                            if not torch.isnan(param.grad).all():
+                                print(f"  Grad stats (excluding NaN): min={param.grad[~torch.isnan(param.grad)].min().item():.6f}, "
+                                      f"max={param.grad[~torch.isnan(param.grad)].max().item():.6f}")
+                            grad_check_failed = True
+                            break  # Stop at first NaN gradient
+
+                if grad_check_failed:
+                    print(f"\n❌ Training terminated due to NaN/Inf in gradients.")
+                    # Save gradient diagnostic
+                    diag_file = os.path.join(self.output_dir,
+                        f"gradient_nan_epoch{self.current_epoch}_batch{batch_idx}.txt")
+                    with open(diag_file, 'w') as f:
+                        f.write(f"Gradient NaN Diagnostic\n")
+                        f.write(f"{'='*70}\n\n")
+                        f.write(f"Epoch: {self.current_epoch}, Batch: {batch_idx}\n\n")
+                        for n, p in self.model.named_parameters():
+                            if p.grad is not None:
+                                has_nan = torch.isnan(p.grad).any().item()
+                                has_inf = torch.isinf(p.grad).any().item()
+                                f.write(f"{n}: has_nan={has_nan}, has_inf={has_inf}\n")
+                    print(f"📝 Gradient diagnostic saved to: {diag_file}")
+                    return float('nan')
 
             total_norm = sum(
                 p.grad.data.norm(2).item() ** 2
@@ -739,7 +1101,14 @@ def main():
     parser.add_argument('--wandb-project', type=str, default='hyperbolic-action-adverb')
     parser.add_argument('--wandb-name', type=str, default=None)
 
+    # Reproducibility
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+
     args = parser.parse_args()
+
+    # Set seed for reproducibility
+    set_seed(args.seed)
+    print(f"Random seed set to: {args.seed}")
 
     hierarchy = Hierarchy(args.hierarchy_path)
 
@@ -763,6 +1132,7 @@ def main():
         'output_dir': args.output_dir,
         'resume_from': args.resume_from,
         'wandb': args.wandb,
+        'seed': args.seed,
     }
 
     train_dataset = ActionAdverbDataset(args.data_dir, args.features_dir, hierarchy, split='train')
