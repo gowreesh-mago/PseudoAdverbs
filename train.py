@@ -14,7 +14,7 @@ from utils import save_args, introduce_adverbs, save_checkpoint, calculate_p1, c
 
 from opts import parser
 from dataset import AdverbDataset
-from model import ActionModifiers, Evaluator, ActionAdverbClassifier, ClassificationEvaluator
+from model import ActionModifiers, Evaluator, ActionAdverbClassifier, ClassificationEvaluator, DualHeadClassifier, DualHeadEvaluator
 from wandb_config import init_wandb_with_config
 import wandb
 
@@ -59,9 +59,14 @@ def main(args):
                                               num_workers=args.workers)
 
     if args.classification_mode:
-        model = ActionAdverbClassifier(train_set, args).cuda()
-        evaluator = ClassificationEvaluator(train_set)
-        criterion = torch.nn.CrossEntropyLoss()
+        if args.dual_head:
+            model = DualHeadClassifier(train_set, args).cuda()
+            evaluator = DualHeadEvaluator(train_set)
+            criterion = torch.nn.CrossEntropyLoss()
+        else:
+            model = ActionAdverbClassifier(train_set, args).cuda()
+            evaluator = ClassificationEvaluator(train_set)
+            criterion = torch.nn.CrossEntropyLoss()
     else:
         model = ActionModifiers(train_set, args).cuda()
         evaluator = Evaluator(train_set, model)
@@ -104,14 +109,23 @@ def main(args):
 
     if args.classification_mode:
         # Classification training loop
-        test_classification(model, test_loader, evaluator, criterion, writer, start_epoch, args)
-        for epoch in range(start_epoch, start_epoch+args.max_epochs+1):
-            train_classification(model, train_loader, optimizer, criterion, writer, epoch, args)
-            if epoch % args.eval_interval == 0:
-                test_classification(model, test_loader, evaluator, criterion, writer, epoch, args)
-            if epoch % args.save_interval == 0 and epoch > 0:
-                save_checkpoint(model, epoch, args.checkpoint_dir)
-        
+        if args.dual_head:
+            test_dual_head(model, test_loader, evaluator, criterion, writer, start_epoch, args)
+            for epoch in range(start_epoch, start_epoch+args.max_epochs+1):
+                train_dual_head(model, train_loader, optimizer, criterion, writer, epoch, args)
+                if epoch % args.eval_interval == 0:
+                    test_dual_head(model, test_loader, evaluator, criterion, writer, epoch, args)
+                if epoch % args.save_interval == 0 and epoch > 0:
+                    save_checkpoint(model, epoch, args.checkpoint_dir)
+        else:
+            test_classification(model, test_loader, evaluator, criterion, writer, start_epoch, args)
+            for epoch in range(start_epoch, start_epoch+args.max_epochs+1):
+                train_classification(model, train_loader, optimizer, criterion, writer, epoch, args)
+                if epoch % args.eval_interval == 0:
+                    test_classification(model, test_loader, evaluator, criterion, writer, epoch, args)
+                if epoch % args.save_interval == 0 and epoch > 0:
+                    save_checkpoint(model, epoch, args.checkpoint_dir)
+
     else:
         # Original metric learning training loop
         if args.pretrain_action:
@@ -595,6 +609,168 @@ def test_classification(model, test_loader, evaluator, criterion, writer, epoch,
     print(f'  Joint Acc: {joint_metrics["joint_accuracy"]:.4f} | Action Acc: {joint_metrics["action_accuracy"]:.4f} | Adverb Acc: {joint_metrics["adverb_accuracy"]:.4f}')
     print(f'  Top-5 Joint: {top5_joint_acc:.4f} | Top-5 Action: {top5_action_acc:.4f} | Top-5 Adverb: {top5_adverb_acc:.4f}')
     print(f'  Action F1: {joint_metrics["action_f1"]:.4f} | Adverb F1: {joint_metrics["adverb_f1"]:.4f}')
+
+
+def train_dual_head(model, train_loader, optimizer, criterion, writer, epoch, args):
+    """Training function for dual-head classifier."""
+    model.train()
+
+    total_action_loss = 0.0
+    total_adverb_loss = 0.0
+    total_combined_loss = 0.0
+
+    all_action_logits = []
+    all_adverb_logits = []
+    all_labels = []
+
+    for idx, data in tqdm.tqdm(enumerate(train_loader), total=len(train_loader)):
+        features = data[0].cuda()
+        labels = data[1].cuda()
+
+        if len(data) > 2:
+            pad = data[2].cuda()
+            model_input = [features, labels, pad]
+        else:
+            model_input = [features, labels]
+
+        action_logits, adverb_logits = model(model_input)
+
+        evaluator = DualHeadEvaluator(model.dset)
+        gt_actions, gt_adverbs = evaluator._extract_action_adverb_labels(labels)
+
+        action_loss = criterion(action_logits, gt_actions)
+        adverb_loss = criterion(adverb_logits, gt_adverbs)
+        combined_loss = args.dual_head_action_weight * action_loss + args.dual_head_adverb_weight * adverb_loss
+
+        optimizer.zero_grad()
+        combined_loss.backward()
+        optimizer.step()
+
+        total_action_loss += action_loss.item()
+        total_adverb_loss += adverb_loss.item()
+        total_combined_loss += combined_loss.item()
+
+        all_action_logits.append(action_logits.detach())
+        all_adverb_logits.append(adverb_logits.detach())
+        all_labels.append(labels)
+
+        if not args.no_wandb:
+            wandb.log({
+                'step/dual_head_action_loss': action_loss.item(),
+                'step/dual_head_adverb_loss': adverb_loss.item(),
+                'step/dual_head_combined_loss': combined_loss.item(),
+            })
+
+    num_batches = len(train_loader)
+    avg_action_loss = total_action_loss / num_batches
+    avg_adverb_loss = total_adverb_loss / num_batches
+    avg_combined_loss = total_combined_loss / num_batches
+
+    all_action_logits = torch.cat(all_action_logits, dim=0)
+    all_adverb_logits = torch.cat(all_adverb_logits, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+
+    metrics = evaluator.calculate_metrics(all_action_logits, all_adverb_logits, all_labels)
+
+    writer.add_scalar('Loss/Train/DualHead_Action', avg_action_loss, epoch)
+    writer.add_scalar('Loss/Train/DualHead_Adverb', avg_adverb_loss, epoch)
+    writer.add_scalar('Loss/Train/DualHead_Combined', avg_combined_loss, epoch)
+    writer.add_scalar('Acc/Train/DualHead_Action_Top1', metrics['action_top1_acc'], epoch)
+    writer.add_scalar('Acc/Train/DualHead_Action_Top5', metrics['action_top5_acc'], epoch)
+    writer.add_scalar('Acc/Train/DualHead_Adverb_Top1', metrics['adverb_top1_acc'], epoch)
+    writer.add_scalar('Acc/Train/DualHead_Adverb_Top5', metrics['adverb_top5_acc'], epoch)
+    writer.add_scalar('Acc/Train/DualHead_Compositional_Top1', metrics['compositional_top1_acc'], epoch)
+    writer.add_scalar('Acc/Train/DualHead_Compositional_Top5', metrics['compositional_top5_acc'], epoch)
+
+    if not args.no_wandb:
+        wandb.log({
+            'epoch': epoch,
+            'train/dual_head_action_loss': avg_action_loss,
+            'train/dual_head_adverb_loss': avg_adverb_loss,
+            'train/dual_head_combined_loss': avg_combined_loss,
+            'train/dual_head_action_top1_acc': metrics['action_top1_acc'],
+            'train/dual_head_action_top5_acc': metrics['action_top5_acc'],
+            'train/dual_head_adverb_top1_acc': metrics['adverb_top1_acc'],
+            'train/dual_head_adverb_top5_acc': metrics['adverb_top5_acc'],
+            'train/dual_head_compositional_top1_acc': metrics['compositional_top1_acc'],
+            'train/dual_head_compositional_top5_acc': metrics['compositional_top5_acc'],
+        })
+
+    print(f'E: {epoch} | Action Loss: {avg_action_loss:.4f} | Adverb Loss: {avg_adverb_loss:.4f} | Combined: {avg_combined_loss:.4f}')
+    print(f'  Action Top-1: {metrics["action_top1_acc"]:.4f} | Action Top-5: {metrics["action_top5_acc"]:.4f}')
+    print(f'  Adverb Top-1: {metrics["adverb_top1_acc"]:.4f} | Adverb Top-5: {metrics["adverb_top5_acc"]:.4f}')
+    print(f'  Compositional Top-1: {metrics["compositional_top1_acc"]:.4f} | Compositional Top-5: {metrics["compositional_top5_acc"]:.4f}')
+
+
+def test_dual_head(model, test_loader, evaluator, criterion, writer, epoch, args):
+    """Testing function for dual-head classifier."""
+    model.eval()
+
+    total_action_loss = 0.0
+    total_adverb_loss = 0.0
+    all_action_logits = []
+    all_adverb_logits = []
+    all_labels = []
+
+    with torch.no_grad():
+        for idx, data in tqdm.tqdm(enumerate(test_loader), total=len(test_loader)):
+            features = data[0].cuda()
+            labels = data[1].cuda()
+
+            if len(data) > 2:
+                pad = data[2].cuda()
+                model_input = [features, labels, pad]
+            else:
+                model_input = [features, labels]
+
+            action_logits, adverb_logits = model(model_input)
+
+            gt_actions, gt_adverbs = evaluator._extract_action_adverb_labels(labels)
+
+            action_loss = criterion(action_logits, gt_actions)
+            adverb_loss = criterion(adverb_logits, gt_adverbs)
+
+            total_action_loss += action_loss.item()
+            total_adverb_loss += adverb_loss.item()
+
+            all_action_logits.append(action_logits)
+            all_adverb_logits.append(adverb_logits)
+            all_labels.append(labels)
+
+    all_action_logits = torch.cat(all_action_logits, dim=0)
+    all_adverb_logits = torch.cat(all_adverb_logits, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+
+    avg_action_loss = total_action_loss / len(test_loader)
+    avg_adverb_loss = total_adverb_loss / len(test_loader)
+    metrics = evaluator.calculate_metrics(all_action_logits, all_adverb_logits, all_labels)
+
+    writer.add_scalar('Loss/Test/DualHead_Action', avg_action_loss, epoch)
+    writer.add_scalar('Loss/Test/DualHead_Adverb', avg_adverb_loss, epoch)
+    writer.add_scalar('Acc/Test/DualHead_Action_Top1', metrics['action_top1_acc'], epoch)
+    writer.add_scalar('Acc/Test/DualHead_Action_Top5', metrics['action_top5_acc'], epoch)
+    writer.add_scalar('Acc/Test/DualHead_Adverb_Top1', metrics['adverb_top1_acc'], epoch)
+    writer.add_scalar('Acc/Test/DualHead_Adverb_Top5', metrics['adverb_top5_acc'], epoch)
+    writer.add_scalar('Acc/Test/DualHead_Compositional_Top1', metrics['compositional_top1_acc'], epoch)
+    writer.add_scalar('Acc/Test/DualHead_Compositional_Top5', metrics['compositional_top5_acc'], epoch)
+
+    if not args.no_wandb:
+        wandb.log({
+            'test/dual_head_action_loss': avg_action_loss,
+            'test/dual_head_adverb_loss': avg_adverb_loss,
+            'test/dual_head_action_top1_acc': metrics['action_top1_acc'],
+            'test/dual_head_action_top5_acc': metrics['action_top5_acc'],
+            'test/dual_head_adverb_top1_acc': metrics['adverb_top1_acc'],
+            'test/dual_head_adverb_top5_acc': metrics['adverb_top5_acc'],
+            'test/dual_head_compositional_top1_acc': metrics['compositional_top1_acc'],
+            'test/dual_head_compositional_top5_acc': metrics['compositional_top5_acc'],
+        })
+
+    print(f'E: {epoch} | Test Action Loss: {avg_action_loss:.4f} | Adverb Loss: {avg_adverb_loss:.4f}')
+    print(f'  Action Top-1: {metrics["action_top1_acc"]:.4f} | Action Top-5: {metrics["action_top5_acc"]:.4f}')
+    print(f'  Adverb Top-1: {metrics["adverb_top1_acc"]:.4f} | Adverb Top-5: {metrics["adverb_top5_acc"]:.4f}')
+    print(f'  Compositional Top-1: {metrics["compositional_top1_acc"]:.4f} | Compositional Top-5: {metrics["compositional_top5_acc"]:.4f}')
+
 
 def calculate_p1_action(dset, scores, action_gt):
     pair_pred = np.argmax(scores.numpy(), axis=1)

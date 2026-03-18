@@ -289,6 +289,158 @@ class ActionAdverbClassifier(nn.Module):
 
         return logits, attention_weights
 
+
+class DualHeadClassifier(nn.Module):
+    """
+    Dual-head classifier with separate heads for action and adverb prediction.
+    Uses mean pooling over temporal dimension to aggregate features.
+    """
+    def __init__(self, dset, args):
+        super(DualHeadClassifier, self).__init__()
+        self.dset = dset
+        self.num_actions = len(dset.action2idx)
+        self.num_adverbs = len(dset.adverb2idx)
+        self.emb_dim = args.emb_dim
+
+        # Input projection (concatenated RGB + Flow features → embedding dimension)
+        # dset.feature_dim is the concatenated dimension (e.g., 2048)
+        self.input_projection = nn.Linear(dset.feature_dim, args.emb_dim)
+
+        # Optional: add a shared encoder (MLP or attention)
+        # For mean pooling approach, we can skip this or add a simple MLP
+        self.feature_encoder = MLP(args.emb_dim, args.emb_dim, num_layers=args.num_layers)
+
+        # Separate classification heads
+        self.action_classifier = nn.Linear(args.emb_dim, self.num_actions)
+        self.adverb_classifier = nn.Linear(args.emb_dim, self.num_adverbs)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [features, class_label, pad]
+            features: (batch_size, temporal_dim, feature_dim) for SDP mode
+                     or (batch_size, feature_dim) for single/average mode
+
+        Returns:
+            action_logits: (batch_size, num_actions)
+            adverb_logits: (batch_size, num_adverbs)
+        """
+        features = x[0]
+        batch_size = features.shape[0]
+
+        # Handle different temporal aggregation modes
+        if len(features.shape) == 3:
+            # SDP mode: (batch_size, temporal_dim, feature_dim)
+            pad = x[2]
+            temporal_dim = features.shape[1]
+
+            # Create mask for valid frames (exclude padding)
+            mask = torch.arange(temporal_dim).expand(len(pad), temporal_dim).cuda() < temporal_dim - pad.unsqueeze(1)
+            mask = mask.unsqueeze(-1)  # (batch_size, temporal_dim, 1)
+
+            # Mean pooling over valid frames
+            masked_features = features * mask.float()
+            valid_frame_counts = mask.sum(dim=1)  # (batch_size, 1)
+            pooled_features = masked_features.sum(dim=1) / valid_frame_counts.clamp(min=1)  # (batch_size, feature_dim)
+        else:
+            # Single/average mode: already aggregated
+            pooled_features = features
+
+        # Project to embedding dimension
+        video_embedding = self.input_projection(pooled_features)  # (batch_size, emb_dim)
+
+        # Optional: pass through shared encoder
+        video_embedding = self.feature_encoder(video_embedding)
+
+        # Separate classification heads
+        action_logits = self.action_classifier(video_embedding)  # (batch_size, num_actions)
+        adverb_logits = self.adverb_classifier(video_embedding)  # (batch_size, num_adverbs)
+
+        return action_logits, adverb_logits
+
+
+class DualHeadEvaluator:
+    """Evaluator for dual-head classifier with separate action and adverb predictions."""
+
+    def __init__(self, dset):
+        self.dset = dset
+        self.num_actions = len(dset.action2idx)
+        self.num_adverbs = len(dset.adverb2idx)
+        self.action2idx = dset.action2idx
+        self.adverb2idx = dset.adverb2idx
+        self.idx2action = dset.idx2action
+        self.idx2adverb = dset.idx2adverb
+
+    def _extract_action_adverb_labels(self, class_labels):
+        """
+        Extract separate action and adverb indices from joint class labels.
+
+        Args:
+            class_labels: (batch_size,) tensor of class indices
+
+        Returns:
+            action_labels: (batch_size,) tensor of action indices
+            adverb_labels: (batch_size,) tensor of adverb indices
+        """
+        action_labels = []
+        adverb_labels = []
+
+        for class_idx in class_labels.cpu().numpy():
+            action, adverb = self.dset.idx2class[class_idx]
+            action_labels.append(self.action2idx[action])
+            adverb_labels.append(self.adverb2idx[adverb])
+
+        return torch.LongTensor(action_labels).cuda(), torch.LongTensor(adverb_labels).cuda()
+
+    def calculate_metrics(self, action_logits, adverb_logits, class_labels):
+        """
+        Calculate all metrics for dual-head predictions.
+
+        Args:
+            action_logits: (batch_size, num_actions)
+            adverb_logits: (batch_size, num_adverbs)
+            class_labels: (batch_size,) joint class labels
+
+        Returns:
+            dict with metrics:
+                - action_top1_acc: Top-1 action accuracy
+                - action_top5_acc: Top-5 action accuracy
+                - adverb_top1_acc: Top-1 adverb accuracy
+                - adverb_top5_acc: Top-5 adverb accuracy
+                - compositional_top1_acc: Both correct (top-1)
+                - compositional_top5_acc: Both in top-5
+        """
+        # Extract ground truth
+        gt_actions, gt_adverbs = self._extract_action_adverb_labels(class_labels)
+
+        # Top-1 predictions
+        action_pred_top1 = torch.argmax(action_logits, dim=1)
+        adverb_pred_top1 = torch.argmax(adverb_logits, dim=1)
+
+        # Top-1 accuracy
+        action_correct_top1 = (action_pred_top1 == gt_actions).float()
+        adverb_correct_top1 = (adverb_pred_top1 == gt_adverbs).float()
+        compositional_correct_top1 = (action_correct_top1 * adverb_correct_top1)
+
+        # Top-5 predictions
+        _, action_pred_top5 = torch.topk(action_logits, min(5, self.num_actions), dim=1)
+        _, adverb_pred_top5 = torch.topk(adverb_logits, min(5, self.num_adverbs), dim=1)
+
+        # Top-5 accuracy
+        action_correct_top5 = (action_pred_top5 == gt_actions.unsqueeze(1)).any(dim=1).float()
+        adverb_correct_top5 = (adverb_pred_top5 == gt_adverbs.unsqueeze(1)).any(dim=1).float()
+        compositional_correct_top5 = (action_correct_top5 * adverb_correct_top5)
+
+        return {
+            'action_top1_acc': action_correct_top1.mean().item(),
+            'action_top5_acc': action_correct_top5.mean().item(),
+            'adverb_top1_acc': adverb_correct_top1.mean().item(),
+            'adverb_top5_acc': adverb_correct_top5.mean().item(),
+            'compositional_top1_acc': compositional_correct_top1.mean().item(),
+            'compositional_top5_acc': compositional_correct_top5.mean().item(),
+        }
+
+
 class ClassificationEvaluator:
     def __init__(self, dset):
         self.dset = dset

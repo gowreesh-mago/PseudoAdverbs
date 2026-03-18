@@ -88,3 +88,11 @@ parser.add_argument('--shared-input-projection', action='store_true', default=Fa
                     help='Share input projection between action and adverb branches')
 parser.add_argument('--shared-pos-encoding', action='store_true', default=False,
                     help='Share positional encoding between action and adverb branches')
+
+# Dual-head classifier arguments
+parser.add_argument('--dual-head', action='store_true', default=False,
+                    help='Use dual-head classifier with separate action and adverb heads')
+parser.add_argument('--dual-head-action-weight', type=float, default=1.0,
+                    help='Weight for action loss in dual-head mode')
+parser.add_argument('--dual-head-adverb-weight', type=float, default=1.0,
+                    help='Weight for adverb loss in dual-head mode')
